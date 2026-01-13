@@ -1,0 +1,1295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RFID Door Lock - Admin Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --dark: #1e293b;
+            --darker: #0f172a;
+            --light: #f1f5f9;
+            --gray: #64748b;
+            --card-bg: #1e293b;
+            --border: #334155;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, var(--darker) 0%, #1a1a2e 100%);
+            min-height: 100vh;
+            color: #e2e8f0;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--primary), #a855f7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .header h1 i {
+            background: linear-gradient(135deg, var(--primary), #a855f7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .device-status {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        .status-badge.online {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+        }
+
+        .status-badge.offline {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--danger);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        .status-dot.online {
+            background: var(--success);
+        }
+
+        .status-dot.offline {
+            background: var(--danger);
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Stats Cards */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: var(--card-bg);
+            border-radius: 16px;
+            padding: 24px;
+            border: 1px solid var(--border);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+        }
+
+        .stat-card .icon {
+            width: 50px;
+            height: 50px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.4rem;
+            margin-bottom: 15px;
+        }
+
+        .stat-card.whitelist .icon {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+        }
+
+        .stat-card.blacklist .icon {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--danger);
+        }
+
+        .stat-card.pending .icon {
+            background: rgba(245, 158, 11, 0.2);
+            color: var(--warning);
+        }
+
+        .stat-card.logs .icon {
+            background: rgba(99, 102, 241, 0.2);
+            color: var(--primary);
+        }
+
+        .stat-card h3 {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 5px;
+        }
+
+        .stat-card p {
+            color: var(--gray);
+            font-size: 0.9rem;
+        }
+
+        /* Main Grid */
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+        }
+
+        @media (max-width: 1024px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Cards */
+        .card {
+            background: var(--card-bg);
+            border-radius: 16px;
+            border: 1px solid var(--border);
+            overflow: hidden;
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 24px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .card-header h2 {
+            font-size: 1.1rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .card-body {
+            padding: 20px 24px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .card-body::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .card-body::-webkit-scrollbar-track {
+            background: var(--darker);
+        }
+
+        .card-body::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 3px;
+        }
+
+        /* User List */
+        .user-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px 16px;
+            background: var(--darker);
+            border-radius: 12px;
+            margin-bottom: 10px;
+            transition: background 0.3s;
+        }
+
+        .user-item:hover {
+            background: rgba(99, 102, 241, 0.1);
+        }
+
+        .user-info {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .user-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        .whitelist-card .user-avatar {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+        }
+
+        .blacklist-card .user-avatar {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--danger);
+        }
+
+        .pending-card .user-avatar {
+            background: rgba(245, 158, 11, 0.2);
+            color: var(--warning);
+        }
+
+        .user-details h4 {
+            font-size: 0.95rem;
+            font-weight: 500;
+            margin-bottom: 3px;
+        }
+
+        .user-details span {
+            font-size: 0.8rem;
+            color: var(--gray);
+            font-family: monospace;
+        }
+
+        .user-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .btn {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 500;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn-icon {
+            padding: 8px 10px;
+        }
+
+        .btn-success {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+        }
+
+        .btn-success:hover {
+            background: var(--success);
+            color: white;
+        }
+
+        .btn-danger {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--danger);
+        }
+
+        .btn-danger:hover {
+            background: var(--danger);
+            color: white;
+        }
+
+        .btn-warning {
+            background: rgba(245, 158, 11, 0.2);
+            color: var(--warning);
+        }
+
+        .btn-warning:hover {
+            background: var(--warning);
+            color: white;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: var(--primary-dark);
+        }
+
+        /* Log Entry */
+        .log-entry {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 14px 16px;
+            background: var(--darker);
+            border-radius: 12px;
+            margin-bottom: 10px;
+        }
+
+        .log-icon {
+            width: 36px;
+            height: 36px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .log-icon.granted {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+        }
+
+        .log-icon.denied {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--danger);
+        }
+
+        .log-icon.pending {
+            background: rgba(245, 158, 11, 0.2);
+            color: var(--warning);
+        }
+
+        .log-icon.management {
+            background: rgba(99, 102, 241, 0.2);
+            color: var(--primary);
+        }
+
+        .log-details {
+            flex: 1;
+        }
+
+        .log-details h4 {
+            font-size: 0.9rem;
+            font-weight: 500;
+            margin-bottom: 4px;
+        }
+
+        .log-meta {
+            display: flex;
+            gap: 15px;
+            font-size: 0.8rem;
+            color: var(--gray);
+        }
+
+        .log-meta span {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        /* Remote Unlock */
+        .unlock-section {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .unlock-section input {
+            flex: 1;
+            padding: 12px 16px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: var(--darker);
+            color: white;
+            font-size: 0.95rem;
+        }
+
+        .unlock-section input:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+        /* Modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal-overlay.active {
+            display: flex;
+        }
+
+        .modal {
+            background: var(--card-bg);
+            border-radius: 16px;
+            padding: 30px;
+            width: 90%;
+            max-width: 400px;
+            border: 1px solid var(--border);
+        }
+
+        .modal h3 {
+            margin-bottom: 20px;
+            font-size: 1.2rem;
+        }
+
+        .modal input {
+            width: 100%;
+            padding: 12px 16px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: var(--darker);
+            color: white;
+            font-size: 0.95rem;
+            margin-bottom: 15px;
+        }
+
+        .modal input:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+
+        /* Filters */
+        .filters {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+        }
+
+        .filter-btn {
+            padding: 8px 14px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--gray);
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: all 0.3s;
+        }
+
+        .filter-btn:hover, .filter-btn.active {
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+
+        .date-input {
+            padding: 8px 14px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: var(--darker);
+            color: white;
+            font-size: 0.85rem;
+        }
+
+        /* Toast */
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            padding: 16px 24px;
+            border-radius: 12px;
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            transform: translateX(150%);
+            transition: transform 0.3s;
+            z-index: 1001;
+        }
+
+        .toast.show {
+            transform: translateX(0);
+        }
+
+        .toast.success {
+            border-color: var(--success);
+        }
+
+        .toast.error {
+            border-color: var(--danger);
+        }
+
+        /* Loading */
+        .loading {
+            display: flex;
+            justify-content: center;
+            padding: 40px;
+        }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid var(--border);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Empty State */
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--gray);
+        }
+
+        .empty-state i {
+            font-size: 3rem;
+            margin-bottom: 15px;
+            opacity: 0.5;
+        }
+
+        /* Full Width Log Card */
+        .logs-card {
+            grid-column: 1 / -1;
+        }
+
+        .logs-card .card-body {
+            max-height: 500px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1><i class="fas fa-door-open"></i> RFID Door Lock System</h1>
+            <div class="device-status">
+                <div class="status-badge" id="deviceStatus">
+                    <span class="status-dot"></span>
+                    <span>Checking...</span>
+                </div>
+                <button class="btn btn-secondary" onclick="triggerDeviceSync()" title="Force ESP32 to sync lists">
+                    <i class="fas fa-sync"></i> Sync Device
+                </button>
+                <button class="btn btn-primary" onclick="remoteUnlock()">
+                    <i class="fas fa-unlock"></i> Remote Unlock
+                </button>
+            </div>
+        </div>
+
+        <!-- Stats -->
+        <div class="stats-grid">
+            <div class="stat-card whitelist">
+                <div class="icon"><i class="fas fa-user-check"></i></div>
+                <h3 id="whitelistCount">0</h3>
+                <p>Whitelisted Users</p>
+            </div>
+            <div class="stat-card blacklist">
+                <div class="icon"><i class="fas fa-user-slash"></i></div>
+                <h3 id="blacklistCount">0</h3>
+                <p>Blacklisted Users</p>
+            </div>
+            <div class="stat-card pending">
+                <div class="icon"><i class="fas fa-user-clock"></i></div>
+                <h3 id="pendingCount">0</h3>
+                <p>Pending Approval</p>
+            </div>
+            <div class="stat-card logs">
+                <div class="icon"><i class="fas fa-history"></i></div>
+                <h3 id="logsCount">0</h3>
+                <p>Total Logs (30 days)</p>
+            </div>
+        </div>
+
+        <!-- Main Grid -->
+        <div class="main-grid">
+            <!-- Pending Users -->
+            <div class="card pending-card">
+                <div class="card-header">
+                    <h2><i class="fas fa-user-clock" style="color: var(--warning)"></i> Pending Users</h2>
+                    <span id="pendingBadge" class="status-badge" style="background: rgba(245, 158, 11, 0.2); color: var(--warning);">0</span>
+                </div>
+                <div class="card-body" id="pendingList">
+                    <div class="loading"><div class="spinner"></div></div>
+                </div>
+            </div>
+
+            <!-- Whitelist -->
+            <div class="card whitelist-card">
+                <div class="card-header">
+                    <h2><i class="fas fa-user-check" style="color: var(--success)"></i> Whitelist</h2>
+                    <button class="btn btn-success" onclick="showAddUserModal('whitelist')">
+                        <i class="fas fa-plus"></i> Add
+                    </button>
+                </div>
+                <div class="card-body" id="whitelistList">
+                    <div class="loading"><div class="spinner"></div></div>
+                </div>
+            </div>
+
+            <!-- Blacklist -->
+            <div class="card blacklist-card">
+                <div class="card-header">
+                    <h2><i class="fas fa-user-slash" style="color: var(--danger)"></i> Blacklist</h2>
+                    <button class="btn btn-danger" onclick="showAddUserModal('blacklist')">
+                        <i class="fas fa-plus"></i> Add
+                    </button>
+                </div>
+                <div class="card-body" id="blacklistList">
+                    <div class="loading"><div class="spinner"></div></div>
+                </div>
+            </div>
+
+            <!-- Access Logs -->
+            <div class="card logs-card">
+                <div class="card-header">
+                    <h2><i class="fas fa-history" style="color: var(--primary)"></i> Access Logs</h2>
+                    <div class="filters">
+                        <button class="filter-btn active" onclick="filterLogs('all', this)">All</button>
+                        <button class="filter-btn" onclick="filterLogs('granted', this)">Granted</button>
+                        <button class="filter-btn" onclick="filterLogs('denied', this)">Denied</button>
+                        <button class="filter-btn" onclick="filterLogs('pending', this)">Pending</button>
+                        <input type="date" class="date-input" onchange="filterLogsByDate(this.value)">
+                    </div>
+                </div>
+                <div class="card-body" id="logsList">
+                    <div class="loading"><div class="spinner"></div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Modal -->
+    <div class="modal-overlay" id="editModal">
+        <div class="modal">
+            <h3 id="modalTitle">Edit User</h3>
+            <input type="text" id="editName" placeholder="Enter name">
+            <input type="text" id="editUid" placeholder="UID (read-only)" readonly style="opacity: 0.6">
+            <input type="hidden" id="editList">
+            <div class="modal-actions">
+                <button class="btn" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveUserEdit()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add User Modal -->
+    <div class="modal-overlay" id="addUserModal">
+        <div class="modal">
+            <h3 id="addModalTitle">Add User</h3>
+            <input type="text" id="addUid" placeholder="Enter UID (e.g., ABCD1234)">
+            <input type="text" id="addName" placeholder="Enter name">
+            <input type="hidden" id="addList">
+            <div class="modal-actions">
+                <button class="btn" onclick="closeAddModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="addNewUser()">Add</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Unlock Modal -->
+    <div class="modal-overlay" id="unlockModal">
+        <div class="modal">
+            <h3><i class="fas fa-unlock"></i> Remote Unlock</h3>
+            <input type="number" id="unlockDuration" placeholder="Duration in seconds (1-300)" min="1" max="300" value="5">
+            <div class="modal-actions">
+                <button class="btn" onclick="closeUnlockModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="executeUnlock()">
+                    <i class="fas fa-unlock"></i> Unlock
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast" id="toast">
+        <i class="fas fa-check-circle"></i>
+        <span id="toastMessage">Success!</span>
+    </div>
+
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
+
+    <script>
+        // ==================== FIREBASE CONFIGURATION ====================
+        // IMPORTANT: Replace with your Firebase project configuration
+        const firebaseConfig = {
+            apiKey: "AIzaSyDFTyL7DjvdcDI_D70ZWMgcgXuTtnxGRnE",
+            authDomain: "emlocksketch.firebaseapp.com",
+            databaseURL: "https://emlocksketch-default-rtdb.asia-southeast1.firebasedatabase.app",
+            projectId: "emlocksketch",
+            storageBucket: "emlocksketch.firebasestorage.app",
+            messagingSenderId: "623229365268",
+            appId: "1:623229365268:web:e35ddecae96a68c02ecb01"
+        };
+
+        // Initialize Firebase
+        firebase.initializeApp(firebaseConfig);
+        const database = firebase.database();
+        const auth = firebase.auth();
+
+        const DEVICE_ID = "device1";
+        const basePath = `devices/${DEVICE_ID}`;
+
+        let allLogs = [];
+        let currentLogFilter = 'all';
+
+        // ==================== AUTHENTICATION ====================
+        // Sign in anonymously or with email/password
+        auth.signInAnonymously()
+            .then(() => {
+                console.log("Signed in to Firebase");
+                initializeListeners();
+            })
+            .catch(error => {
+                console.error("Auth error:", error);
+                showToast("Authentication failed", "error");
+            });
+
+        // ==================== REAL-TIME LISTENERS ====================
+        function initializeListeners() {
+            console.log("Initializing listeners for path:", basePath);
+            
+            // Device Status
+            database.ref(`${basePath}/status`).on('value', snapshot => {
+                const status = snapshot.val();
+                console.log("Status data:", status);
+                updateDeviceStatus(status);
+            }, error => {
+                console.error("Status listener error:", error);
+            });
+
+            // Whitelist
+            database.ref(`${basePath}/whitelist`).on('value', snapshot => {
+                const data = snapshot.val() || {};
+                console.log("Whitelist data:", data);
+                renderUserList('whitelistList', data, 'whitelist');
+                document.getElementById('whitelistCount').textContent = Object.keys(data).length;
+            }, error => {
+                console.error("Whitelist listener error:", error);
+            });
+
+            // Blacklist
+            database.ref(`${basePath}/blacklist`).on('value', snapshot => {
+                const data = snapshot.val() || {};
+                console.log("Blacklist data:", data);
+                renderUserList('blacklistList', data, 'blacklist');
+                document.getElementById('blacklistCount').textContent = Object.keys(data).length;
+            }, error => {
+                console.error("Blacklist listener error:", error);
+            });
+
+            // Pending
+            database.ref(`${basePath}/pending`).on('value', snapshot => {
+                const data = snapshot.val() || {};
+                console.log("Pending data:", data);
+                renderPendingList(data);
+                document.getElementById('pendingCount').textContent = Object.keys(data).length;
+                document.getElementById('pendingBadge').textContent = Object.keys(data).length;
+            }, error => {
+                console.error("Pending listener error:", error);
+            });
+
+            // Logs (last 30 days)
+            const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+            database.ref(`${basePath}/logs`)
+                .orderByKey()
+                .startAt(String(Math.floor(thirtyDaysAgo / 1000)))
+                .on('value', snapshot => {
+                    const data = snapshot.val() || {};
+                    console.log("Logs data:", data);
+                    allLogs = Object.entries(data).map(([key, value]) => ({
+                        id: key,
+                        ...value
+                    })).reverse();
+                    document.getElementById('logsCount').textContent = allLogs.length;
+                    renderLogs();
+                }, error => {
+                    console.error("Logs listener error:", error);
+                });
+        }
+        
+        // Debug: Also try reading the data once directly to see raw structure
+        function debugReadData() {
+            database.ref(basePath).once('value')
+                .then(snapshot => {
+                    console.log("=== FULL DATABASE STRUCTURE ===");
+                    console.log(JSON.stringify(snapshot.val(), null, 2));
+                })
+                .catch(error => {
+                    console.error("Debug read error:", error);
+                });
+        }
+        // Call debug function
+        setTimeout(debugReadData, 2000);
+
+        // ==================== UPDATE DEVICE STATUS ====================
+        function updateDeviceStatus(status) {
+            const statusEl = document.getElementById('deviceStatus');
+            
+            if (status && status.online) {
+                const lastSeen = new Date(status.lastSeen);
+                const now = new Date();
+                const diffMinutes = (now - lastSeen) / 1000 / 60;
+                
+                if (diffMinutes < 5) {
+                    statusEl.className = 'status-badge online';
+                    statusEl.innerHTML = `
+                        <span class="status-dot online"></span>
+                        <span>Online • ${status.ip}</span>
+                    `;
+                } else {
+                    statusEl.className = 'status-badge offline';
+                    statusEl.innerHTML = `
+                        <span class="status-dot offline"></span>
+                        <span>Last seen: ${lastSeen.toLocaleTimeString()}</span>
+                    `;
+                }
+            } else {
+                statusEl.className = 'status-badge offline';
+                statusEl.innerHTML = `
+                    <span class="status-dot offline"></span>
+                    <span>Offline</span>
+                `;
+            }
+        }
+
+        // ==================== RENDER FUNCTIONS ====================
+        function renderUserList(containerId, data, listType) {
+            const container = document.getElementById(containerId);
+            const entries = Object.entries(data);
+
+            if (entries.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <i class="fas fa-users"></i>
+                        <p>No users in this list</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = entries.map(([uid, userData]) => {
+                const name = typeof userData === 'object' ? userData.name : userData;
+                const initials = name.substring(0, 2).toUpperCase();
+                
+                return `
+                    <div class="user-item">
+                        <div class="user-info">
+                            <div class="user-avatar">${initials}</div>
+                            <div class="user-details">
+                                <h4>${name}</h4>
+                                <span>${uid}</span>
+                            </div>
+                        </div>
+                        <div class="user-actions">
+                            <button class="btn btn-icon btn-warning" onclick="editUser('${uid}', '${name}', '${listType}')" title="Edit">
+                                <i class="fas fa-edit"></i>
+                            </button>
+                            ${listType === 'whitelist' ? `
+                                <button class="btn btn-icon btn-danger" onclick="moveUser('${uid}', 'whitelist', 'blacklist')" title="Move to Blacklist">
+                                    <i class="fas fa-ban"></i>
+                                </button>
+                            ` : `
+                                <button class="btn btn-icon btn-success" onclick="moveUser('${uid}', 'blacklist', 'whitelist')" title="Move to Whitelist">
+                                    <i class="fas fa-check"></i>
+                                </button>
+                            `}
+                            <button class="btn btn-icon btn-danger" onclick="deleteUser('${uid}', '${listType}')" title="Delete">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderPendingList(data) {
+            const container = document.getElementById('pendingList');
+            const entries = Object.entries(data);
+
+            if (entries.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <i class="fas fa-inbox"></i>
+                        <p>No pending users</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = entries.map(([uid, userData]) => {
+                const name = typeof userData === 'object' ? userData.name : userData;
+                const firstSeen = userData.firstSeen ? new Date(userData.firstSeen).toLocaleString() : 'Unknown';
+                
+                return `
+                    <div class="user-item">
+                        <div class="user-info">
+                            <div class="user-avatar">?</div>
+                            <div class="user-details">
+                                <h4>${name}</h4>
+                                <span>${uid}</span>
+                            </div>
+                        </div>
+                        <div class="user-actions">
+                            <button class="btn btn-success" onclick="approvePending('${uid}')">
+                                <i class="fas fa-check"></i> Approve
+                            </button>
+                            <button class="btn btn-danger" onclick="denyPending('${uid}')">
+                                <i class="fas fa-ban"></i> Deny
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderLogs() {
+            const container = document.getElementById('logsList');
+            
+            let filteredLogs = allLogs;
+            if (currentLogFilter !== 'all') {
+                filteredLogs = allLogs.filter(log => log.status === currentLogFilter);
+            }
+
+            if (filteredLogs.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <i class="fas fa-clipboard-list"></i>
+                        <p>No logs found</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = filteredLogs.slice(0, 100).map(log => {
+                const iconClass = log.status === 'granted' ? 'granted' : 
+                                  log.status === 'denied' ? 'denied' : 
+                                  log.status === 'pending' ? 'pending' : 'management';
+                const icon = log.status === 'granted' ? 'fa-check' : 
+                             log.status === 'denied' ? 'fa-times' : 
+                             log.status === 'pending' ? 'fa-clock' : 'fa-cog';
+                
+                const time = new Date(log.time);
+                
+                return `
+                    <div class="log-entry">
+                        <div class="log-icon ${iconClass}">
+                            <i class="fas ${icon}"></i>
+                        </div>
+                        <div class="log-details">
+                            <h4>${log.name} - ${log.status.toUpperCase()}</h4>
+                            <div class="log-meta">
+                                <span><i class="fas fa-id-card"></i> ${log.uid}</span>
+                                <span><i class="fas fa-clock"></i> ${time.toLocaleString()}</span>
+                                <span><i class="fas fa-tag"></i> ${log.type}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // ==================== USER MANAGEMENT ====================
+        async function approvePending(uid) {
+            const namePrompt = prompt("Enter name for this user:", "Unknown");
+            if (!namePrompt) return;
+
+            try {
+                // Add to whitelist
+                await database.ref(`${basePath}/whitelist/${uid}`).set({
+                    name: namePrompt,
+                    addedAt: new Date().toISOString()
+                });
+                
+                // Remove from pending
+                await database.ref(`${basePath}/pending/${uid}`).remove();
+                
+                showToast(`${namePrompt} approved and added to whitelist`, 'success');
+                
+                // Auto-trigger device sync
+                triggerDeviceSync();
+            } catch (error) {
+                showToast('Error approving user', 'error');
+                console.error(error);
+            }
+        }
+
+        async function denyPending(uid) {
+            if (!confirm('Move this card to blacklist?')) return;
+
+            try {
+                // Get current data
+                const snapshot = await database.ref(`${basePath}/pending/${uid}`).get();
+                const userData = snapshot.val() || { name: 'Unknown' };
+                
+                // Add to blacklist
+                await database.ref(`${basePath}/blacklist/${uid}`).set({
+                    name: userData.name,
+                    addedAt: new Date().toISOString()
+                });
+                
+                // Remove from pending
+                await database.ref(`${basePath}/pending/${uid}`).remove();
+                
+                showToast('Card added to blacklist', 'success');
+                
+                // Auto-trigger device sync
+                triggerDeviceSync();
+            } catch (error) {
+                showToast('Error denying user', 'error');
+                console.error(error);
+            }
+        }
+
+        async function moveUser(uid, fromList, toList) {
+            try {
+                // Get current data
+                const snapshot = await database.ref(`${basePath}/${fromList}/${uid}`).get();
+                const userData = snapshot.val();
+                
+                // Add to destination
+                await database.ref(`${basePath}/${toList}/${uid}`).set({
+                    ...userData,
+                    movedAt: new Date().toISOString()
+                });
+                
+                // Remove from source
+                await database.ref(`${basePath}/${fromList}/${uid}`).remove();
+                
+                showToast(`User moved to ${toList}`, 'success');
+                
+                // Auto-trigger device sync
+                triggerDeviceSync();
+            } catch (error) {
+                showToast('Error moving user', 'error');
+                console.error(error);
+            }
+        }
+
+        async function deleteUser(uid, listType) {
+            if (!confirm('Are you sure you want to delete this user?')) return;
+
+            try {
+                await database.ref(`${basePath}/${listType}/${uid}`).remove();
+                showToast('User deleted', 'success');
+                
+                // Auto-trigger device sync
+                triggerDeviceSync();
+            } catch (error) {
+                showToast('Error deleting user', 'error');
+                console.error(error);
+            }
+        }
+
+        // ==================== MODALS ====================
+        function editUser(uid, name, listType) {
+            document.getElementById('editUid').value = uid;
+            document.getElementById('editName').value = name;
+            document.getElementById('editList').value = listType;
+            document.getElementById('modalTitle').textContent = `Edit User - ${listType}`;
+            document.getElementById('editModal').classList.add('active');
+        }
+
+        function closeModal() {
+            document.getElementById('editModal').classList.remove('active');
+        }
+
+        async function saveUserEdit() {
+            const uid = document.getElementById('editUid').value;
+            const name = document.getElementById('editName').value;
+            const listType = document.getElementById('editList').value;
+
+            if (!name.trim()) {
+                showToast('Please enter a name', 'error');
+                return;
+            }
+
+            try {
+                await database.ref(`${basePath}/${listType}/${uid}/name`).set(name);
+                showToast('User updated', 'success');
+                closeModal();
+                
+                // Auto-trigger device sync
+                triggerDeviceSync();
+            } catch (error) {
+                showToast('Error updating user', 'error');
+                console.error(error);
+            }
+        }
+
+        function showAddUserModal(listType) {
+            document.getElementById('addUid').value = '';
+            document.getElementById('addName').value = '';
+            document.getElementById('addList').value = listType;
+            document.getElementById('addModalTitle').textContent = `Add to ${listType}`;
+            document.getElementById('addUserModal').classList.add('active');
+        }
+
+        function closeAddModal() {
+            document.getElementById('addUserModal').classList.remove('active');
+        }
+
+        async function addNewUser() {
+            const uid = document.getElementById('addUid').value.toUpperCase().trim();
+            const name = document.getElementById('addName').value.trim();
+            const listType = document.getElementById('addList').value;
+
+            if (!uid || !name) {
+                showToast('Please enter both UID and name', 'error');
+                return;
+            }
+
+            try {
+                await database.ref(`${basePath}/${listType}/${uid}`).set({
+                    name: name,
+                    addedAt: new Date().toISOString()
+                });
+                showToast(`User added to ${listType}`, 'success');
+                closeAddModal();
+                
+                // Auto-trigger device sync
+                triggerDeviceSync();
+            } catch (error) {
+                showToast('Error adding user', 'error');
+                console.error(error);
+            }
+        }
+
+        // ==================== REMOTE UNLOCK ====================
+        function remoteUnlock() {
+            document.getElementById('unlockModal').classList.add('active');
+        }
+        
+        // ==================== TRIGGER DEVICE SYNC ====================
+        async function triggerDeviceSync() {
+            try {
+                await database.ref(`${basePath}/commands/sync`).set({
+                    timestamp: Date.now()
+                });
+                showToast('Sync command sent to device', 'success');
+                
+                // Remove the sync command after 2 seconds
+                setTimeout(async () => {
+                    await database.ref(`${basePath}/commands/sync`).remove();
+                }, 2000);
+            } catch (error) {
+                showToast('Error sending sync command', 'error');
+                console.error(error);
+            }
+        }
+
+        function closeUnlockModal() {
+            document.getElementById('unlockModal').classList.remove('active');
+        }
+
+        async function executeUnlock() {
+            const duration = parseInt(document.getElementById('unlockDuration').value);
+            
+            if (!duration || duration < 1 || duration > 300) {
+                showToast('Please enter a valid duration (1-300)', 'error');
+                return;
+            }
+
+            try {
+                await database.ref(`${basePath}/commands/unlock`).set({
+                    duration: duration,
+                    timestamp: Date.now()
+                });
+                showToast(`Door unlocking for ${duration} seconds`, 'success');
+                closeUnlockModal();
+            } catch (error) {
+                showToast('Error sending unlock command', 'error');
+                console.error(error);
+            }
+        }
+
+        // ==================== LOG FILTERS ====================
+        function filterLogs(filter, btn) {
+            currentLogFilter = filter;
+            document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+            if (btn) btn.classList.add('active');
+            renderLogs();
+        }
+
+        function filterLogsByDate(date) {
+            if (!date) {
+                currentLogFilter = 'all';
+            } else {
+                const selectedDate = new Date(date).toISOString().split('T')[0];
+                allLogs = allLogs.filter(log => {
+                    const logDate = new Date(log.time).toISOString().split('T')[0];
+                    return logDate === selectedDate;
+                });
+            }
+            renderLogs();
+        }
+
+        // ==================== TOAST ====================
+        function showToast(message, type = 'success') {
+            const toast = document.getElementById('toast');
+            const toastMessage = document.getElementById('toastMessage');
+            
+            toast.className = `toast ${type} show`;
+            toastMessage.textContent = message;
+            toast.querySelector('i').className = type === 'success' ? 'fas fa-check-circle' : 'fas fa-exclamation-circle';
+            
+            setTimeout(() => {
+                toast.classList.remove('show');
+            }, 3000);
+        }
+
+        // Close modals on outside click
+        document.querySelectorAll('.modal-overlay').forEach(modal => {
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) {
+                    modal.classList.remove('active');
+                }
+            });
+        });
+    </script>
+</body>
+</html>
