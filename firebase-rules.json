@@ -1,0 +1,48 @@
+{
+  "rules": {
+    "devices": {
+      "$deviceId": {
+        ".read": "auth != null",
+        ".write": "auth != null",
+        
+        "whitelist": {
+          ".indexOn": ["name", "addedAt"],
+          "$uid": {
+            ".validate": "newData.hasChildren(['name'])"
+          }
+        },
+        
+        "blacklist": {
+          ".indexOn": ["name", "addedAt"],
+          "$uid": {
+            ".validate": "newData.hasChildren(['name'])"
+          }
+        },
+        
+        "pending": {
+          ".indexOn": ["name", "firstSeen"],
+          "$uid": {
+            ".validate": "newData.hasChildren(['name'])"
+          }
+        },
+        
+        "logs": {
+          ".indexOn": [".key", "time", "status", "uid"],
+          "$timestamp": {
+            ".validate": "newData.hasChildren(['uid', 'name', 'status', 'type', 'time'])"
+          }
+        },
+        
+        "commands": {
+          "unlock": {
+            ".validate": "newData.hasChildren(['duration', 'timestamp']) && newData.child('duration').isNumber() && newData.child('duration').val() >= 1 && newData.child('duration').val() <= 300"
+          }
+        },
+        
+        "status": {
+          ".validate": "newData.hasChildren(['online', 'lastSeen'])"
+        }
+      }
+    }
+  }
+}
