@@ -778,19 +778,25 @@
         let allLogs = [];
         let currentLogFilter = 'all';
         
-        // ==================== INPUT VALIDATION (matches ESP32) ====================
-        const MAX_UID_LENGTH = 16;
+        // ==================== INPUT VALIDATION (matches ESP32 v2.0) ====================
+        const MIN_UID_LENGTH = 8;
+        const MAX_UID_LENGTH = 20;
         const MAX_NAME_LENGTH = 45;
         
         function isValidUID(uid) {
-            if (!uid || uid.length === 0 || uid.length > MAX_UID_LENGTH) return false;
+            if (!uid) return false;
+            const len = uid.length;
+            // Must be 8-20 characters
+            if (len < MIN_UID_LENGTH || len > MAX_UID_LENGTH) return false;
+            // Must be even length (hex bytes)
+            if (len % 2 !== 0) return false;
             // Only allow hex characters
             return /^[0-9A-Fa-f]+$/.test(uid);
         }
         
         function sanitizeName(name) {
-            if (!name) return 'Unknown';
-            return name.substring(0, MAX_NAME_LENGTH);
+            if (!name || name.trim().length === 0) return 'Unknown';
+            return name.trim().substring(0, MAX_NAME_LENGTH);
         }
         
         function isValidList(list) {
@@ -799,27 +805,35 @@
 
         // ==================== AUTHENTICATION ====================
         // Sign in anonymously or with email/password
+        console.log("Attempting Firebase authentication...");
         auth.signInAnonymously()
-            .then(() => {
-                console.log("Signed in to Firebase");
+            .then((userCredential) => {
+                console.log("Signed in to Firebase successfully!");
+                console.log("User UID:", userCredential.user.uid);
                 initializeListeners();
             })
             .catch(error => {
-                console.error("Auth error:", error);
-                showToast("Authentication failed", "error");
+                console.error("Auth error code:", error.code);
+                console.error("Auth error message:", error.message);
+                showToast("Authentication failed: " + error.message, "error");
+                
+                // Try to initialize anyway for debugging
+                console.log("Attempting to initialize listeners without auth...");
+                initializeListeners();
             });
 
         // ==================== REAL-TIME LISTENERS ====================
         function initializeListeners() {
             console.log("Initializing listeners for path:", basePath);
+            console.log("Full status path:", `${basePath}/status`);
             
             // Device Status
             database.ref(`${basePath}/status`).on('value', snapshot => {
                 const status = snapshot.val();
-                console.log("Status data:", status);
+                console.log("Status data received:", status);
                 updateDeviceStatus(status);
             }, error => {
-                console.error("Status listener error:", error);
+                console.error("Status listener error:", error.code, error.message);
             });
 
             // Whitelist
@@ -1238,9 +1252,9 @@
                 return;
             }
             
-            // Validate UID (must be hex characters, max 16 chars)
+            // Validate UID (must be hex characters, 8-20 chars, even length)
             if (!isValidUID(uid)) {
-                showToast('Invalid UID: must be hex characters (0-9, A-F), max 16 chars', 'error');
+                showToast('Invalid UID: must be 8-20 hex characters (0-9, A-F), even length', 'error');
                 return;
             }
             
