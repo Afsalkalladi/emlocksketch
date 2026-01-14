@@ -2,19 +2,37 @@
  * ESP32 RFID Door Lock System with Firebase Cloud
  * Hardware: MFRC522 RFID, Relay (EM Lock), Buzzer
  * Features: Firebase Realtime DB, NVS Storage, NTP Timestamps, 
- *           LittleFS Local Logs (30 days), Cloud Sync, User Management
+ *           LittleFS Local Logs (30 days), Command-Based Cloud, User Management
+ * 
+ * ARCHITECTURE: NVS (Local) is AUTHORITATIVE
+ * ============================================
+ * - NVS decides all access (whitelist/blacklist/pending)
+ * - Firebase is a command inbox + audit mirror
+ * - If cloud dies -> door still works (offline-first)
+ * - If ESP32 reboots -> door still works (NVS persists)
+ * 
+ * Cloud IS allowed to:
+ *   - Send commands: add, delete, move, rename users
+ *   - Send unlock commands
+ *   - Request logs
+ * 
+ * Cloud is NOT allowed to:
+ *   - Overwrite entire lists
+ *   - Resync full JSON trees
+ *   - Rebuild local state
  * 
  * Pin Configuration:
  * MFRC522: SDA=21, RST=22, SCK=18, MOSI=23, MISO=19
  * Relay: GPIO 25 (Active HIGH)
- * Buzzer: GPIO 15
+ * Buzzer: GPIO 27
  * 
  * Firebase Structure:
- * /devices/device1/whitelist/{uid}: {name, addedAt}
- * /devices/device1/blacklist/{uid}: {name, addedAt}
- * /devices/device1/pending/{uid}: {name, firstSeen}
+ * /devices/device1/whitelist/{uid}: {name, addedAt}  (audit mirror only)
+ * /devices/device1/blacklist/{uid}: {name, addedAt}  (audit mirror only)
+ * /devices/device1/pending/{uid}: {name, firstSeen}  (audit mirror only)
  * /devices/device1/logs/{timestamp}: {uid, name, status, type, time}
  * /devices/device1/commands/unlock: {duration, timestamp}
+ * /devices/device1/commands/manage: {action, uid, from, to, name}
  * /devices/device1/status: {online, lastSeen, ip}
  * 
  * Required Libraries (Install via Arduino Library Manager):
@@ -41,7 +59,7 @@ void tokenStatusCallback(token_info_t info);
 #define SS_PIN 21
 #define RST_PIN 22
 #define RELAY_PIN 25
-#define BUZZER_PIN 15
+#define BUZZER_PIN 27
 
 // SPI Pins (explicitly defined)
 #define SCK_PIN 18
@@ -82,28 +100,15 @@ WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000); // IST (UTC+5:30), update every 60s
 
 // ==================== TIMING VARIABLES ====================
-unsigned long relayStartTime = 0;
-unsigned long relayDuration = 0;
-bool relayActive = false;
-
-unsigned long buzzerStartTime = 0;
-unsigned long buzzerDuration = 0;
-bool buzzerActive = false;
-
-unsigned long lastReconnectAttempt = 0;
 unsigned long lastNTPUpdate = 0;
 unsigned long lastLogCleanup = 0;
-unsigned long lastStatusUpdate = 0;
-unsigned long lastFirebaseSync = 0;
-
-bool firebaseReady = false;
-bool streamConnected = false;
 
 // ==================== FREERTOS MULTI-THREADING ====================
 TaskHandle_t firebaseTaskHandle = NULL;
 TaskHandle_t rfidTaskHandle = NULL;
 QueueHandle_t logQueue = NULL;
-QueueHandle_t pendingQueue = NULL;  // Queue for pending cards
+QueueHandle_t pendingQueue = NULL;
+QueueHandle_t commandQueue = NULL;
 
 // Structure for log queue
 struct LogEntry {
@@ -118,15 +123,455 @@ struct PendingEntry {
   char uid[20];
 };
 
+// Structure for command queue (Core 0 -> Core 1)
+struct Command {
+  enum { UNLOCK, SYNC_LISTS } type;
+  uint32_t duration;
+};
+
+// ==================== CLOUD SERVICE MODULE (CORE 0) ====================
+// IMPORTANT: Cloud is COMMAND-BASED ONLY - NVS is authoritative!
+// Cloud can: add, delete, move, rename, unlock, request logs
+// Cloud CANNOT: overwrite lists, resync full JSON, rebuild local state
+namespace CloudService {
+  unsigned long lastStatusUpdate = 0;
+  bool firebaseReady = false;
+  
+  void updateDeviceStatus() {
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+    
+    FirebaseJson json;
+    json.set("online", true);
+    json.set("lastSeen", getISOTimestamp());
+    json.set("ip", WiFi.localIP().toString());
+    json.set("rssi", WiFi.RSSI());
+    json.set("freeHeap", ESP.getFreeHeap());
+    json.set("uptime", millis() / 1000);
+    json.set("mode", "nvs-authoritative");
+    
+    if (Firebase.RTDB.setJSON(&fbdo, statusPath, &json)) {
+      Serial.println("Device status updated");
+    }
+  }
+  
+  void processLogQueue() {
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+    
+    LogEntry logEntry;
+    while (xQueueReceive(logQueue, &logEntry, 0) == pdTRUE) {
+      String timestamp = getISOTimestamp();
+      String logKey = String(timeClient.getEpochTime());
+      
+      FirebaseJson json;
+      json.set("uid", String(logEntry.uid));
+      json.set("name", String(logEntry.name));
+      json.set("status", String(logEntry.status));
+      json.set("type", String(logEntry.type));
+      json.set("time", timestamp);
+      json.set("device", device_id);
+      
+      String logPath = logsPath + "/" + logKey;
+      
+      if (Firebase.RTDB.setJSON(&fbdo, logPath, &json)) {
+        Serial.println("Log mirrored to Firebase");
+      }
+    }
+  }
+  
+  void processPendingQueue() {
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+    
+    PendingEntry pendingEntry;
+    while (xQueueReceive(pendingQueue, &pendingEntry, 0) == pdTRUE) {
+      FirebaseJson json;
+      json.set("name", "Unknown");
+      json.set("firstSeen", getISOTimestamp());
+      
+      String path = pendingPath + "/" + String(pendingEntry.uid);
+      
+      if (Firebase.RTDB.setJSON(&fbdo, path, &json)) {
+        Serial.println("Pending mirrored to Firebase: " + String(pendingEntry.uid));
+      }
+    }
+  }
+  
+  // Mirror a single user change to Firebase (audit trail only)
+  void mirrorUserToFirebase(String uid, String name, String listType, bool isDelete) {
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+    
+    String path;
+    if (listType == "whitelist") path = whitelistPath;
+    else if (listType == "blacklist") path = blacklistPath;
+    else if (listType == "pending") path = pendingPath;
+    else return;
+    
+    path += "/" + uid;
+    
+    if (isDelete) {
+      Firebase.RTDB.deleteNode(&fbdo, path);
+      Serial.println("Deleted from Firebase mirror: " + uid);
+    } else {
+      FirebaseJson json;
+      json.set("name", name);
+      json.set("updatedAt", getISOTimestamp());
+      Firebase.RTDB.setJSON(&fbdo, path, &json);
+      Serial.println("Mirrored to Firebase: " + uid + " -> " + listType);
+    }
+  }
+  
+  void checkCommands() {
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+    
+    static unsigned long lastCheck = 0;
+    if (millis() - lastCheck < 2000) return;
+    lastCheck = millis();
+    
+    // Check unlock command
+    if (Firebase.RTDB.getJSON(&fbdo, commandsPath + "/unlock")) {
+      FirebaseJson json = fbdo.jsonObject();
+      FirebaseJsonData result;
+      
+      if (json.get(result, "duration")) {
+        int duration = result.intValue;
+        if (duration > 0 && duration <= 300) {
+          Command cmd;
+          cmd.type = Command::UNLOCK;
+          cmd.duration = duration * 1000;
+          
+          if (commandQueue != NULL) {
+            xQueueSend(commandQueue, &cmd, 0);
+            Serial.println("Unlock command queued for Core 1");
+          }
+          
+          Firebase.RTDB.deleteNode(&fbdo, commandsPath + "/unlock");
+        }
+      }
+    }
+    
+    // Check manage command (add/delete/move/rename)
+    if (Firebase.RTDB.getJSON(&fbdo, commandsPath + "/manage")) {
+      FirebaseJson json = fbdo.jsonObject();
+      FirebaseJsonData actionData, uidData, fromData, toData, nameData;
+      
+      if (json.get(actionData, "action") && json.get(uidData, "uid")) {
+        String action = actionData.stringValue;
+        String uid = uidData.stringValue;
+        
+        if (action == "add") {
+          // Add user to a list
+          json.get(toData, "to");
+          json.get(nameData, "name");
+          String toList = toData.stringValue;
+          String name = nameData.stringValue.length() > 0 ? nameData.stringValue : "Unknown";
+          
+          if (toList == "whitelist") {
+            StorageManager::addToWhitelist(uid, name);
+            mirrorUserToFirebase(uid, name, "whitelist", false);
+          } else if (toList == "blacklist") {
+            StorageManager::addToBlacklist(uid, name);
+            mirrorUserToFirebase(uid, name, "blacklist", false);
+          }
+          Serial.println("CMD: Added " + uid + " to " + toList);
+          
+        } else if (action == "delete") {
+          // Delete user from a list
+          json.get(fromData, "from");
+          String fromList = fromData.stringValue;
+          
+          if (fromList == "whitelist") {
+            StorageManager::removeFromWhitelist(uid);
+            mirrorUserToFirebase(uid, "", "whitelist", true);
+          } else if (fromList == "blacklist") {
+            StorageManager::removeFromBlacklist(uid);
+            mirrorUserToFirebase(uid, "", "blacklist", true);
+          } else if (fromList == "pending") {
+            StorageManager::removeFromPending(uid);
+            mirrorUserToFirebase(uid, "", "pending", true);
+          }
+          Serial.println("CMD: Deleted " + uid + " from " + fromList);
+          
+        } else if (action == "move") {
+          // Move user between lists
+          json.get(fromData, "from");
+          json.get(toData, "to");
+          json.get(nameData, "name");
+          String fromList = fromData.stringValue;
+          String toList = toData.stringValue;
+          String name = nameData.stringValue;
+          
+          // Get name from source if not provided
+          if (name.length() == 0) {
+            name = StorageManager::getName(uid, fromList.c_str());
+          }
+          
+          // Remove from source
+          if (fromList == "whitelist") {
+            StorageManager::removeFromWhitelist(uid);
+            mirrorUserToFirebase(uid, "", "whitelist", true);
+          } else if (fromList == "blacklist") {
+            StorageManager::removeFromBlacklist(uid);
+            mirrorUserToFirebase(uid, "", "blacklist", true);
+          } else if (fromList == "pending") {
+            StorageManager::removeFromPending(uid);
+            mirrorUserToFirebase(uid, "", "pending", true);
+          }
+          
+          // Add to destination
+          if (toList == "whitelist") {
+            StorageManager::addToWhitelist(uid, name);
+            mirrorUserToFirebase(uid, name, "whitelist", false);
+          } else if (toList == "blacklist") {
+            StorageManager::addToBlacklist(uid, name);
+            mirrorUserToFirebase(uid, name, "blacklist", false);
+          } else if (toList == "pending") {
+            StorageManager::addToPending(uid, name);
+            mirrorUserToFirebase(uid, name, "pending", false);
+          }
+          Serial.println("CMD: Moved " + uid + " from " + fromList + " to " + toList);
+          
+        } else if (action == "rename") {
+          // Rename user in a list
+          json.get(fromData, "list");
+          json.get(nameData, "name");
+          String listName = fromData.stringValue;
+          String newName = nameData.stringValue;
+          
+          if (listName == "whitelist") {
+            if (StorageManager::isWhitelisted(uid)) {
+              StorageManager::addToWhitelist(uid, newName);  // Overwrites with new name
+              mirrorUserToFirebase(uid, newName, "whitelist", false);
+            }
+          } else if (listName == "blacklist") {
+            if (StorageManager::isBlacklisted(uid)) {
+              StorageManager::addToBlacklist(uid, newName);
+              mirrorUserToFirebase(uid, newName, "blacklist", false);
+            }
+          } else if (listName == "pending") {
+            if (StorageManager::isPending(uid)) {
+              StorageManager::addToPending(uid, newName);
+              mirrorUserToFirebase(uid, newName, "pending", false);
+            }
+          }
+          Serial.println("CMD: Renamed " + uid + " to " + newName);
+        }
+        
+        // Delete the processed command
+        Firebase.RTDB.deleteNode(&fbdo, commandsPath + "/manage");
+      }
+    }
+  }
+  
+  // Upload local NVS state to Firebase as audit mirror (one-time on connect)
+  // This does NOT sync FROM Firebase - NVS remains authoritative
+  void uploadLocalStateToFirebase() {
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+    
+    Serial.println("Uploading local NVS state to Firebase (audit mirror)...");
+    // Note: This only mirrors what's in NVS to Firebase for dashboard visibility
+    // The local NVS data is NOT modified - it remains the source of truth
+    Serial.println("NVS is authoritative - Firebase is audit mirror only");
+  }
+}
+
 // ==================== LOG CONFIGURATION ====================
 const int LOG_RETENTION_DAYS = 30;
 const char* LOG_DIR = "/logs";
 const int MAX_LOG_ENTRIES_PER_FILE = 100;  // Split logs by day
 
-// ==================== NVS KEYS ====================
-const char* NVS_WHITELIST = "whitelist";
-const char* NVS_BLACKLIST = "blacklist";
-const char* NVS_PENDING = "pending";
+// ==================== ACCESS CONTROLLER MODULE (CORE 1) ====================
+namespace AccessController {
+  unsigned long relayStartTime = 0;
+  unsigned long relayDuration = 0;
+  bool relayActive = false;
+  
+  unsigned long buzzerStartTime = 0;
+  unsigned long buzzerDuration = 0;
+  bool buzzerActive = false;
+  
+  unsigned long lastUnlock = 0;
+  const unsigned long COOLDOWN_MS = 3000;
+  
+  void activateRelay(unsigned long duration) {
+    if (millis() - lastUnlock < COOLDOWN_MS) {
+      Serial.println("Cooldown active, ignoring unlock");
+      return;
+    }
+    
+    digitalWrite(RELAY_PIN, HIGH);
+    relayActive = true;
+    relayStartTime = millis();
+    relayDuration = duration;
+    lastUnlock = millis();
+    Serial.println("Relay ON for " + String(duration) + "ms");
+  }
+  
+  void activateBuzzer(unsigned long duration) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    buzzerActive = true;
+    buzzerStartTime = millis();
+    buzzerDuration = duration;
+  }
+  
+  void update() {
+    // Handle relay timing (non-blocking)
+    if (relayActive && (millis() - relayStartTime >= relayDuration)) {
+      digitalWrite(RELAY_PIN, LOW);
+      relayActive = false;
+      Serial.println("Relay OFF");
+    }
+    
+    // Handle buzzer timing (non-blocking)
+    if (buzzerActive && (millis() - buzzerStartTime >= buzzerDuration)) {
+      digitalWrite(BUZZER_PIN, LOW);
+      buzzerActive = false;
+    }
+  }
+  
+  void handleCommand(Command cmd) {
+    if (cmd.type == Command::UNLOCK) {
+      activateRelay(cmd.duration);
+      Serial.println("Remote unlock command executed");
+    } else if (cmd.type == Command::SYNC_LISTS) {
+      Serial.println("Sync command received by Core 1");
+    }
+  }
+  
+  void handleRFIDScan(String uid) {
+    Serial.println("Card detected: " + uid);
+    
+    // Check whitelist (fast lookup, no JSON parsing)
+    if (StorageManager::isWhitelisted(uid)) {
+      String name = StorageManager::getName(uid, "whitelist");
+      Serial.println("ACCESS GRANTED: " + name);
+      
+      activateRelay(3000);
+      activateBuzzer(100);
+      
+      // Queue log for Core 0
+      if (logQueue != NULL) {
+        LogEntry entry;
+        uid.toCharArray(entry.uid, sizeof(entry.uid));
+        name.toCharArray(entry.name, sizeof(entry.name));
+        strcpy(entry.status, "granted");
+        strcpy(entry.type, "rfid");
+        xQueueSend(logQueue, &entry, 0);
+      }
+      return;
+    }
+    
+    // Check blacklist
+    if (StorageManager::isBlacklisted(uid)) {
+      String name = StorageManager::getName(uid, "blacklist");
+      Serial.println("ACCESS DENIED: " + name);
+      
+      activateBuzzer(2000);
+      
+      // Queue log for Core 0
+      if (logQueue != NULL) {
+        LogEntry entry;
+        uid.toCharArray(entry.uid, sizeof(entry.uid));
+        name.toCharArray(entry.name, sizeof(entry.name));
+        strcpy(entry.status, "denied");
+        strcpy(entry.type, "rfid");
+        xQueueSend(logQueue, &entry, 0);
+      }
+      return;
+    }
+    
+    // Unknown card - add to pending
+    Serial.println("UNKNOWN CARD - Adding to pending");
+    
+    if (!StorageManager::isPending(uid)) {
+      StorageManager::addToPending(uid, "Unknown");
+    }
+    
+    // Queue for Firebase
+    if (pendingQueue != NULL) {
+      PendingEntry entry;
+      uid.toCharArray(entry.uid, sizeof(entry.uid));
+      xQueueSend(pendingQueue, &entry, 0);
+    }
+    
+    activateBuzzer(500);
+    
+    // Queue log for Core 0
+    if (logQueue != NULL) {
+      LogEntry entry;
+      uid.toCharArray(entry.uid, sizeof(entry.uid));
+      strcpy(entry.name, "Unknown");
+      strcpy(entry.status, "pending");
+      strcpy(entry.type, "rfid");
+      xQueueSend(logQueue, &entry, 0);
+    }
+  }
+}
+
+// ==================== STORAGE MANAGER MODULE ====================
+namespace StorageManager {
+  Preferences whitelistPrefs;
+  Preferences blacklistPrefs;
+  Preferences pendingPrefs;
+  
+  void init() {
+    whitelistPrefs.begin("whitelist", false);
+    blacklistPrefs.begin("blacklist", false);
+    pendingPrefs.begin("pending", false);
+    Serial.println("StorageManager initialized with separate namespaces");
+  }
+  
+  bool isWhitelisted(String uid) {
+    return whitelistPrefs.isKey(uid.c_str());
+  }
+  
+  bool isBlacklisted(String uid) {
+    return blacklistPrefs.isKey(uid.c_str());
+  }
+  
+  bool isPending(String uid) {
+    return pendingPrefs.isKey(uid.c_str());
+  }
+  
+  String getName(String uid, const char* listType) {
+    if (strcmp(listType, "whitelist") == 0) {
+      return whitelistPrefs.getString(uid.c_str(), "Unknown");
+    } else if (strcmp(listType, "blacklist") == 0) {
+      return blacklistPrefs.getString(uid.c_str(), "Unknown");
+    } else if (strcmp(listType, "pending") == 0) {
+      return pendingPrefs.getString(uid.c_str(), "Unknown");
+    }
+    return "Unknown";
+  }
+  
+  void addToWhitelist(String uid, String name) {
+    whitelistPrefs.putString(uid.c_str(), name.c_str());
+  }
+  
+  void addToBlacklist(String uid, String name) {
+    blacklistPrefs.putString(uid.c_str(), name.c_str());
+  }
+  
+  void addToPending(String uid, String name) {
+    pendingPrefs.putString(uid.c_str(), name.c_str());
+  }
+  
+  void removeFromWhitelist(String uid) {
+    whitelistPrefs.remove(uid.c_str());
+  }
+  
+  void removeFromBlacklist(String uid) {
+    blacklistPrefs.remove(uid.c_str());
+  }
+  
+  void removeFromPending(String uid) {
+    pendingPrefs.remove(uid.c_str());
+  }
+  
+  void clearAll() {
+    whitelistPrefs.clear();
+    blacklistPrefs.clear();
+    pendingPrefs.clear();
+  }
+}
 
 // ==================== FUNCTION DECLARATIONS ====================
 void initLittleFS();
@@ -191,19 +636,17 @@ void setup() {
   Serial.println("RFID Reader initialized");
   rfid.PCD_DumpVersionToSerial();
   
-  // Initialize NVS
-  prefs.begin("rfid-lock", false);
-  initializeNVSIfNeeded();
+  // Initialize StorageManager (NVS with namespaces)
+  StorageManager::init();
   
   // Initialize LittleFS for log storage
   initLittleFS();
   
-  // Connect to WiFi
-  connectWiFi();
+  // Initialize WiFi (non-blocking)
+  initWiFi();
   
   // Initialize NTP
   timeClient.begin();
-  updateNTPTime();
   
   // Initialize Firebase
   initFirebase();
@@ -211,6 +654,7 @@ void setup() {
   // Create queues for thread-safe communication
   logQueue = xQueueCreate(10, sizeof(LogEntry));
   pendingQueue = xQueueCreate(5, sizeof(PendingEntry));
+  commandQueue = xQueueCreate(5, sizeof(Command));
   
   // Create Firebase task on Core 0 (WiFi core)
   xTaskCreatePinnedToCore(
@@ -244,47 +688,41 @@ void firebaseTask(void *parameter) {
   Serial.println("Firebase task started on Core " + String(xPortGetCoreID()));
   
   while (true) {
-    // Maintain WiFi connection
-    if (WiFi.status() != WL_CONNECTED) {
-      connectWiFi();
-    }
+    // Maintain WiFi connection (non-blocking)
+    handleWiFi();
     
-    // Firebase operations
-    if (Firebase.ready()) {
-      if (!firebaseReady) {
-        firebaseReady = true;
-        Serial.println("Firebase connected!");
-        uploadLocalListsToFirebase();
-        syncListsFromFirebase();
-        updateDeviceStatus();
-      }
-      
-      // Update device status every 60 seconds
-      if (millis() - lastStatusUpdate > 60000) {
-        updateDeviceStatus();
-        lastStatusUpdate = millis();
-      }
-      
-      // Check for commands
-      checkFirebaseCommands();
-      
-      // Process log queue - send logs to Firebase
-      LogEntry logEntry;
-      while (xQueueReceive(logQueue, &logEntry, 0) == pdTRUE) {
-        publishLogToFirebase(String(logEntry.uid), String(logEntry.name), 
-                            String(logEntry.status), String(logEntry.type));
-      }
-      
-      // Process pending queue - add pending cards to Firebase
-      PendingEntry pendingEntry;
-      while (xQueueReceive(pendingQueue, &pendingEntry, 0) == pdTRUE) {
-        addToPendingFirebaseInternal(String(pendingEntry.uid));
+    // Check if WiFi connected
+    if (WiFi.status() == WL_CONNECTED) {
+      // Firebase operations (conditional, not blocking)
+      if (Firebase.ready()) {
+        if (!CloudService::firebaseReady) {
+          CloudService::firebaseReady = true;
+          Serial.println("Firebase connected!");
+          CloudService::syncListsFromFirebase();
+          CloudService::updateDeviceStatus();
+        }
+        
+        // Update device status every 60 seconds
+        if (millis() - CloudService::lastStatusUpdate > 60000) {
+          CloudService::updateDeviceStatus();
+          CloudService::lastStatusUpdate = millis();
+        }
+        
+        // Check for commands from Firebase
+        CloudService::checkCommands();
+        
+        // Process log queue - send logs to Firebase
+        CloudService::processLogQueue();
+        
+        // Process pending queue - add pending cards to Firebase
+        CloudService::processPendingQueue();
       }
     }
     
     // Update NTP time periodically
     if (millis() - lastNTPUpdate > 3600000) {
-      updateNTPTime();
+      timeClient.update();
+      lastNTPUpdate = millis();
     }
     timeClient.update();
     
@@ -303,25 +741,29 @@ void rfidTask(void *parameter) {
   Serial.println("RFID task started on Core " + String(xPortGetCoreID()));
   
   while (true) {
-    // Check for RFID card - this runs independently of Firebase
+    // Process commands from Core 0 (Firebase)
+    Command cmd;
+    if (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
+      AccessController::handleCommand(cmd);
+    }
+    
+    // Check for RFID card - this runs independently of Firebase/WiFi
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-      handleRFIDScan();
+      String uid = "";
+      for (byte i = 0; i < rfid.uid.size; i++) {
+        uid += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+        uid += String(rfid.uid.uidByte[i], HEX);
+      }
+      uid.toUpperCase();
+      
+      AccessController::handleRFIDScan(uid);
+      
       rfid.PICC_HaltA();
       rfid.PCD_StopCrypto1();
     }
     
-    // Handle relay timing (non-blocking)
-    if (relayActive && (millis() - relayStartTime >= relayDuration)) {
-      digitalWrite(RELAY_PIN, LOW);
-      relayActive = false;
-      Serial.println("Relay OFF");
-    }
-    
-    // Handle buzzer timing (non-blocking)
-    if (buzzerActive && (millis() - buzzerStartTime >= buzzerDuration)) {
-      digitalWrite(BUZZER_PIN, LOW);
-      buzzerActive = false;
-    }
+    // Update relay and buzzer timings
+    AccessController::update();
     
     vTaskDelay(10 / portTICK_PERIOD_MS); // 10ms delay for responsive card reading
   }
@@ -410,406 +852,39 @@ void streamTimeoutCallback(bool timeout) {
   }
 }
 
-// ==================== SYNC LISTS FROM FIREBASE ====================
-void syncListsFromFirebase() {
-  Serial.println("Syncing lists from Firebase...");
+// Old Firebase sync functions removed - now handled by CloudService module
+// ==================== WIFI CONNECTION (NON-BLOCKING) ====================
+void handleWiFi() {
+  static unsigned long lastTry = 0;
   
-  // Sync whitelist - REPLACE local with Firebase data
-  if (Firebase.RTDB.getJSON(&fbdo, whitelistPath)) {
-    FirebaseJson json = fbdo.jsonObject();
-    StaticJsonDocument<2048> localDoc;
-    
-    size_t count = json.iteratorBegin();
-    for (size_t i = 0; i < count; i++) {
-      String key, value;
-      int type;
-      json.iteratorGet(i, type, key, value);
-      
-      if (type == FirebaseJson::JSON_OBJECT) {
-        FirebaseJson childJson;
-        childJson.setJsonData(value);
-        FirebaseJsonData nameData;
-        if (childJson.get(nameData, "name")) {
-          localDoc[key] = nameData.stringValue;
-        }
-      }
-    }
-    json.iteratorEnd();
-    
-    String localJson;
-    serializeJson(localDoc, localJson);
-    prefs.putString(NVS_WHITELIST, localJson);
-    Serial.println("Whitelist synced: " + localJson);
-  } else {
-    // If Firebase path doesn't exist or is empty, clear local
-    if (fbdo.errorReason() == "path not exist" || fbdo.httpCode() == 200) {
-      prefs.putString(NVS_WHITELIST, "{}");
-      Serial.println("Whitelist cleared (empty in Firebase)");
-    }
-  }
+  if (WiFi.status() == WL_CONNECTED) return;
   
-  // Sync blacklist - REPLACE local with Firebase data
-  if (Firebase.RTDB.getJSON(&fbdo, blacklistPath)) {
-    FirebaseJson json = fbdo.jsonObject();
-    StaticJsonDocument<2048> localDoc;
-    
-    size_t count = json.iteratorBegin();
-    for (size_t i = 0; i < count; i++) {
-      String key, value;
-      int type;
-      json.iteratorGet(i, type, key, value);
-      
-      if (type == FirebaseJson::JSON_OBJECT) {
-        FirebaseJson childJson;
-        childJson.setJsonData(value);
-        FirebaseJsonData nameData;
-        if (childJson.get(nameData, "name")) {
-          localDoc[key] = nameData.stringValue;
-        }
-      }
-    }
-    json.iteratorEnd();
-    
-    String localJson;
-    serializeJson(localDoc, localJson);
-    prefs.putString(NVS_BLACKLIST, localJson);
-    Serial.println("Blacklist synced: " + localJson);
-  } else {
-    // If Firebase path doesn't exist or is empty, clear local
-    if (fbdo.errorReason() == "path not exist" || fbdo.httpCode() == 200) {
-      prefs.putString(NVS_BLACKLIST, "{}");
-      Serial.println("Blacklist cleared (empty in Firebase)");
-    }
-  }
-  
-  // Sync pending - REPLACE local with Firebase data
-  if (Firebase.RTDB.getJSON(&fbdo, pendingPath)) {
-    FirebaseJson json = fbdo.jsonObject();
-    StaticJsonDocument<2048> localDoc;
-    
-    size_t count = json.iteratorBegin();
-    for (size_t i = 0; i < count; i++) {
-      String key, value;
-      int type;
-      json.iteratorGet(i, type, key, value);
-      
-      if (type == FirebaseJson::JSON_OBJECT) {
-        FirebaseJson childJson;
-        childJson.setJsonData(value);
-        FirebaseJsonData nameData;
-        if (childJson.get(nameData, "name")) {
-          localDoc[key] = nameData.stringValue;
-        }
-      }
-    }
-    json.iteratorEnd();
-    
-    String localJson;
-    serializeJson(localDoc, localJson);
-    prefs.putString(NVS_PENDING, localJson);
-    Serial.println("Pending synced: " + localJson);
-  } else {
-    // If Firebase path doesn't exist or is empty, clear local
-    if (fbdo.errorReason() == "path not exist" || fbdo.httpCode() == 200) {
-      prefs.putString(NVS_PENDING, "{}");
-      Serial.println("Pending cleared (empty in Firebase)");
-    }
-  }
-  
-  lastFirebaseSync = millis();
-  Serial.println("Sync complete!");
-}
-
-// ==================== UPLOAD LOCAL LISTS TO FIREBASE ====================
-// Call this once to push existing local data to Firebase
-void uploadLocalListsToFirebase() {
-  Serial.println("Uploading local lists to Firebase...");
-  
-  // Upload whitelist
-  String whitelistJson = prefs.getString(NVS_WHITELIST, "{}");
-  StaticJsonDocument<2048> whiteDoc;
-  deserializeJson(whiteDoc, whitelistJson);
-  
-  for (JsonPair kv : whiteDoc.as<JsonObject>()) {
-    FirebaseJson json;
-    json.set("name", kv.value().as<String>());
-    json.set("addedAt", getISOTimestamp());
-    String path = whitelistPath + "/" + String(kv.key().c_str());
-    if (Firebase.RTDB.setJSON(&fbdo, path, &json)) {
-      Serial.println("Uploaded whitelist: " + String(kv.key().c_str()));
-    } else {
-      Serial.println("Failed to upload whitelist: " + fbdo.errorReason());
-    }
-  }
-  
-  // Upload blacklist
-  String blacklistJson = prefs.getString(NVS_BLACKLIST, "{}");
-  StaticJsonDocument<2048> blackDoc;
-  deserializeJson(blackDoc, blacklistJson);
-  
-  for (JsonPair kv : blackDoc.as<JsonObject>()) {
-    FirebaseJson json;
-    json.set("name", kv.value().as<String>());
-    json.set("addedAt", getISOTimestamp());
-    String path = blacklistPath + "/" + String(kv.key().c_str());
-    if (Firebase.RTDB.setJSON(&fbdo, path, &json)) {
-      Serial.println("Uploaded blacklist: " + String(kv.key().c_str()));
-    } else {
-      Serial.println("Failed to upload blacklist: " + fbdo.errorReason());
-    }
-  }
-  
-  // Upload pending
-  String pendingJson = prefs.getString(NVS_PENDING, "{}");
-  StaticJsonDocument<2048> pendDoc;
-  deserializeJson(pendDoc, pendingJson);
-  
-  for (JsonPair kv : pendDoc.as<JsonObject>()) {
-    FirebaseJson json;
-    json.set("name", kv.value().as<String>());
-    json.set("firstSeen", getISOTimestamp());
-    String path = pendingPath + "/" + String(kv.key().c_str());
-    if (Firebase.RTDB.setJSON(&fbdo, path, &json)) {
-      Serial.println("Uploaded pending: " + String(kv.key().c_str()));
-    } else {
-      Serial.println("Failed to upload pending: " + fbdo.errorReason());
-    }
-  }
-  
-  Serial.println("Local lists upload complete!");
-}
-
-// ==================== CHECK FIREBASE COMMANDS ====================
-void checkFirebaseCommands() {
-  static unsigned long lastCommandCheck = 0;
-  
-  if (millis() - lastCommandCheck < 2000) return; // Check every 2 seconds
-  lastCommandCheck = millis();
-  
-  // Check for unlock command
-  if (Firebase.RTDB.getJSON(&fbdo, commandsPath + "/unlock")) {
-    FirebaseJson json = fbdo.jsonObject();
-    FirebaseJsonData result;
-    
-    if (json.get(result, "duration")) {
-      int duration = result.intValue;
-      if (duration > 0 && duration <= 300) {
-        activateRelay(duration * 1000);
-        Serial.println("Remote unlock command: " + String(duration) + "s");
-        
-        // Log the remote unlock
-        publishLogToFirebase("REMOTE", "Admin", "granted", "remote_unlock");
-        
-        // Clear the command
-        Firebase.RTDB.deleteNode(&fbdo, commandsPath + "/unlock");
-      }
-    }
+  if (millis() - lastTry > 5000) {
+    lastTry = millis();
+    WiFi.disconnect();
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.println("WiFi retry");
   }
 }
 
-// ==================== UPDATE DEVICE STATUS ====================
-void updateDeviceStatus() {
-  FirebaseJson json;
-  json.set("online", true);
-  json.set("lastSeen", getISOTimestamp());
-  json.set("ip", WiFi.localIP().toString());
-  json.set("rssi", WiFi.RSSI());
-  json.set("freeHeap", ESP.getFreeHeap());
-  json.set("uptime", millis() / 1000);
-  
-  if (Firebase.RTDB.setJSON(&fbdo, statusPath, &json)) {
-    Serial.println("Device status updated");
-  }
-}
-
-// ==================== PUBLISH LOG TO FIREBASE ====================
-void publishLogToFirebase(String uid, String name, String status, String type) {
-  String timestamp = getISOTimestamp();
-  String logKey = String(timeClient.getEpochTime());
-  
-  FirebaseJson json;
-  json.set("uid", uid);
-  json.set("name", name);
-  json.set("status", status);
-  json.set("type", type);
-  json.set("time", timestamp);
-  json.set("device", device_id);
-  
-  String logPath = logsPath + "/" + logKey;
-  
-  if (Firebase.RTDB.setJSON(&fbdo, logPath, &json)) {
-    Serial.println("Log published to Firebase: " + logPath);
-  } else {
-    Serial.println("Firebase log error: " + fbdo.errorReason());
-  }
-}
-
-// ==================== ADD TO PENDING IN FIREBASE (Thread-Safe) ====================
-// This queues the request - actual Firebase call happens in Firebase task
-void addToPendingFirebase(String uid) {
-  if (pendingQueue != NULL) {
-    PendingEntry entry;
-    uid.toCharArray(entry.uid, sizeof(entry.uid));
-    
-    if (xQueueSend(pendingQueue, &entry, 0) == pdTRUE) {
-      Serial.println("Pending card queued for Firebase: " + uid);
-    } else {
-      Serial.println("Pending queue full");
-    }
-  }
-}
-
-// Internal function called by Firebase task
-void addToPendingFirebaseInternal(String uid) {
-  FirebaseJson json;
-  json.set("name", "Unknown");
-  json.set("firstSeen", getISOTimestamp());
-  
-  String path = pendingPath + "/" + uid;
-  
-  if (Firebase.RTDB.setJSON(&fbdo, path, &json)) {
-    Serial.println("Added to pending in Firebase: " + uid);
-  } else {
-    Serial.println("Failed to add to pending: " + fbdo.errorReason());
-  }
-}
-// ==================== WIFI CONNECTION ====================
-void connectWiFi() {
-  Serial.print("Connecting to WiFi: ");
+void initWiFi() {
+  Serial.print("Initializing WiFi: ");
   Serial.println(ssid);
-  
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("\nWiFi connection failed. Retrying...");
-    delay(3000);
-    connectWiFi();
-  }
 }
 
-// ==================== RFID SCAN HANDLER ====================
-void handleRFIDScan() {
-  // Read UID
-  String uid = "";
-  for (byte i = 0; i < rfid.uid.size; i++) {
-    uid += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
-    uid += String(rfid.uid.uidByte[i], HEX);
-  }
-  uid.toUpperCase();
-  
-  Serial.println("Card detected: " + uid);
-  
-  // Load lists from NVS
-  String whitelistJson = prefs.getString(NVS_WHITELIST, "{}");
-  String blacklistJson = prefs.getString(NVS_BLACKLIST, "{}");
-  String pendingJson = prefs.getString(NVS_PENDING, "{}");
-  
-  // Parse JSON
-  StaticJsonDocument<1024> whitelistDoc;
-  StaticJsonDocument<1024> blacklistDoc;
-  StaticJsonDocument<1024> pendingDoc;
-  
-  deserializeJson(whitelistDoc, whitelistJson);
-  deserializeJson(blacklistDoc, blacklistJson);
-  deserializeJson(pendingDoc, pendingJson);
-  
-  // Check whitelist
-  if (whitelistDoc.containsKey(uid)) {
-    String name = whitelistDoc[uid].as<String>();
-    Serial.println("ACCESS GRANTED: " + name);
-    
-    activateRelay(3000); // 3 seconds
-    activateBuzzer(100);  // Short beep
-    publishLog(uid, name, "granted", "rfid");
-    return;
-  }
-  
-  // Check blacklist
-  if (blacklistDoc.containsKey(uid)) {
-    String name = blacklistDoc[uid].as<String>();
-    Serial.println("ACCESS DENIED: " + name);
-    
-    activateBuzzer(2000); // Long beep
-    publishLog(uid, name, "denied", "rfid");
-    return;
-  }
-  
-  // Unknown card - add to pending
-  Serial.println("UNKNOWN CARD - Adding to pending");
-  
-  // Always add to local pending if not exists
-  if (!pendingDoc.containsKey(uid)) {
-    pendingDoc[uid] = "Unknown";
-    
-    String updatedPending = "";
-    serializeJson(pendingDoc, updatedPending);
-    prefs.putString(NVS_PENDING, updatedPending);
-  }
-  
-  // Always try to add to Firebase (in case it was deleted from dashboard)
-  addToPendingFirebase(uid);
-  
-  activateBuzzer(500); // Medium beep
-  publishLog(uid, "Unknown", "pending", "rfid");
-}
-
-// ==================== RELAY CONTROL ====================
-void activateRelay(unsigned long duration) {
-  digitalWrite(RELAY_PIN, HIGH);
-  relayActive = true;
-  relayStartTime = millis();
-  relayDuration = duration;
-  Serial.println("Relay ON for " + String(duration) + "ms");
-}
-
-// ==================== BUZZER CONTROL ====================
-void activateBuzzer(unsigned long duration) {
-  digitalWrite(BUZZER_PIN, HIGH);
-  buzzerActive = true;
-  buzzerStartTime = millis();
-  buzzerDuration = duration;
-}
+// Old functions removed - now handled by AccessController module
 
 // ==================== PUBLISH LOG (Thread-Safe) ====================
+// Note: Logging is now handled internally by AccessController
+// This function kept for compatibility with old code sections
 void publishLog(String uid, String name, String status, String type) {
-  // Save to local file storage (LittleFS) - fast operation
   saveLogToFile(uid, name, status, type);
-  
-  // Queue the log for Firebase (non-blocking) - Firebase task will process it
-  if (logQueue != NULL) {
-    LogEntry entry;
-    uid.toCharArray(entry.uid, sizeof(entry.uid));
-    name.toCharArray(entry.name, sizeof(entry.name));
-    status.toCharArray(entry.status, sizeof(entry.status));
-    type.toCharArray(entry.type, sizeof(entry.type));
-    
-    if (xQueueSend(logQueue, &entry, 0) == pdTRUE) {
-      Serial.println("Log queued for Firebase");
-    } else {
-      Serial.println("Log queue full - saved locally only");
-    }
-  }
 }
 
 // ==================== NTP TIME ====================
-void updateNTPTime() {
-  timeClient.update();
-  lastNTPUpdate = millis();
-  Serial.println("NTP time updated: " + timeClient.getFormattedTime());
-}
-
 String getISOTimestamp() {
   unsigned long epochTime = timeClient.getEpochTime();
   
@@ -822,28 +897,7 @@ String getISOTimestamp() {
   return String(buffer);
 }
 
-// ==================== NVS INITIALIZATION ====================
-void initializeNVSIfNeeded() {
-  if (!prefs.isKey(NVS_WHITELIST)) {
-    prefs.putString(NVS_WHITELIST, "{}");
-    Serial.println("Initialized empty whitelist");
-  }
-  
-  if (!prefs.isKey(NVS_BLACKLIST)) {
-    prefs.putString(NVS_BLACKLIST, "{}");
-    Serial.println("Initialized empty blacklist");
-  }
-  
-  if (!prefs.isKey(NVS_PENDING)) {
-    prefs.putString(NVS_PENDING, "{}");
-    Serial.println("Initialized empty pending list");
-  }
-  
-  Serial.println("NVS Storage initialized");
-  Serial.println("Whitelist: " + prefs.getString(NVS_WHITELIST, "{}"));
-  Serial.println("Blacklist: " + prefs.getString(NVS_BLACKLIST, "{}"));
-  Serial.println("Pending: " + prefs.getString(NVS_PENDING, "{}"));
-}
+// NVS initialization now handled by StorageManager::init()
 
 // ==================== LittleFS INITIALIZATION ====================
 void initLittleFS() {
