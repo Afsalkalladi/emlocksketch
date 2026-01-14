@@ -36,6 +36,18 @@
         "commands": {
           "unlock": {
             ".validate": "newData.hasChildren(['duration', 'timestamp']) && newData.child('duration').isNumber() && newData.child('duration').val() >= 1 && newData.child('duration').val() <= 300"
+          },
+          "add": {
+            ".validate": "newData.hasChildren(['list', 'uid', 'timestamp']) && newData.child('list').isString() && (newData.child('list').val() == 'whitelist' || newData.child('list').val() == 'blacklist' || newData.child('list').val() == 'pending') && newData.child('uid').isString() && newData.child('uid').val().length >= 1 && newData.child('uid').val().length <= 16"
+          },
+          "delete": {
+            ".validate": "newData.hasChildren(['list', 'uid', 'timestamp']) && newData.child('list').isString() && (newData.child('list').val() == 'whitelist' || newData.child('list').val() == 'blacklist' || newData.child('list').val() == 'pending') && newData.child('uid').isString()"
+          },
+          "move": {
+            ".validate": "newData.hasChildren(['from', 'to', 'uid', 'timestamp']) && newData.child('from').isString() && newData.child('to').isString() && (newData.child('from').val() == 'whitelist' || newData.child('from').val() == 'blacklist' || newData.child('from').val() == 'pending') && (newData.child('to').val() == 'whitelist' || newData.child('to').val() == 'blacklist' || newData.child('to').val() == 'pending') && newData.child('uid').isString()"
+          },
+          "rename": {
+            ".validate": "newData.hasChildren(['list', 'uid', 'name', 'timestamp']) && newData.child('list').isString() && (newData.child('list').val() == 'whitelist' || newData.child('list').val() == 'blacklist' || newData.child('list').val() == 'pending') && newData.child('uid').isString() && newData.child('name').isString() && newData.child('name').val().length >= 1 && newData.child('name').val().length <= 45"
           }
         },
         

@@ -1,38 +1,42 @@
 /*
  * ESP32 RFID Door Lock System with Firebase Cloud
- * Hardware: MFRC522 RFID, Relay (EM Lock), Buzzer
- * Features: Firebase Realtime DB, NVS Storage, NTP Timestamps, 
- *           LittleFS Local Logs (30 days), Command-Based Cloud, User Management
+ * Hardware: MFRC522 RFID, Relay (EM Lock), Buzzer, Exit Sensor
+ * Features: Firebase Realtime DB, NVS Storage (Authoritative), NTP Timestamps, 
+ *           LittleFS Local Logs (30 days), Cloud Commands, User Management
  * 
- * ARCHITECTURE: NVS (Local) is AUTHORITATIVE
- * ============================================
- * - NVS decides all access (whitelist/blacklist/pending)
- * - Firebase is a command inbox + audit mirror
- * - If cloud dies -> door still works (offline-first)
- * - If ESP32 reboots -> door still works (NVS persists)
- * 
- * Cloud IS allowed to:
- *   - Send commands: add, delete, move, rename users
- *   - Send unlock commands
- *   - Request logs
+ * ARCHITECTURE PRINCIPLE:
+ * NVS (ESP32 local storage) is AUTHORITATIVE for access decisions
+ * Firebase is a command inbox + audit mirror
  * 
  * Cloud is NOT allowed to:
- *   - Overwrite entire lists
- *   - Resync full JSON trees
- *   - Rebuild local state
+ * - Overwrite lists
+ * - Resync full JSON trees
+ * - "Rebuild" local state
+ * 
+ * Cloud IS allowed to:
+ * - Send commands: add, delete, move, rename
+ * - Request logs
+ * - Send unlock commands
+ * 
+ * If cloud dies → door still works
+ * If ESP32 reboots → door still works (NVS persists)
  * 
  * Pin Configuration:
  * MFRC522: SDA=21, RST=22, SCK=18, MOSI=23, MISO=19
  * Relay: GPIO 25 (Active HIGH)
  * Buzzer: GPIO 27
+ * Exit Sensor: GPIO 26 (NC switch, LOW=idle, HIGH=hand detected)
  * 
  * Firebase Structure:
- * /devices/device1/whitelist/{uid}: {name, addedAt}  (audit mirror only)
- * /devices/device1/blacklist/{uid}: {name, addedAt}  (audit mirror only)
- * /devices/device1/pending/{uid}: {name, firstSeen}  (audit mirror only)
+ * /devices/device1/whitelist/{uid}: {name, addedAt}
+ * /devices/device1/blacklist/{uid}: {name, addedAt}
+ * /devices/device1/pending/{uid}: {name, firstSeen}
  * /devices/device1/logs/{timestamp}: {uid, name, status, type, time}
  * /devices/device1/commands/unlock: {duration, timestamp}
- * /devices/device1/commands/manage: {action, uid, from, to, name}
+ * /devices/device1/commands/add: {list, uid, name}
+ * /devices/device1/commands/delete: {list, uid}
+ * /devices/device1/commands/move: {from, to, uid, name}
+ * /devices/device1/commands/rename: {list, uid, name}
  * /devices/device1/status: {online, lastSeen, ip}
  * 
  * Required Libraries (Install via Arduino Library Manager):
@@ -60,6 +64,7 @@ void tokenStatusCallback(token_info_t info);
 #define RST_PIN 22
 #define RELAY_PIN 25
 #define BUZZER_PIN 27
+#define EXIT_SENSOR_PIN 26  // NC switch: LOW=idle, HIGH=hand detected
 
 // SPI Pins (explicitly defined)
 #define SCK_PIN 18
@@ -109,6 +114,7 @@ TaskHandle_t rfidTaskHandle = NULL;
 QueueHandle_t logQueue = NULL;
 QueueHandle_t pendingQueue = NULL;
 QueueHandle_t commandQueue = NULL;
+SemaphoreHandle_t nvsMutex = NULL;  // Mutex for thread-safe NVS access
 
 // Structure for log queue
 struct LogEntry {
@@ -129,12 +135,125 @@ struct Command {
   uint32_t duration;
 };
 
+// ==================== FORWARD DECLARATIONS ====================
+// These must come before namespaces that use them
+String getISOTimestamp();
+
+// ==================== STORAGE MANAGER MODULE ====================
+// Thread-safe NVS access with mutex protection
+// MUST be declared before CloudService and AccessController
+namespace StorageManager {
+  Preferences whitelistPrefs;
+  Preferences blacklistPrefs;
+  Preferences pendingPrefs;
+  
+  void init() {
+    whitelistPrefs.begin("whitelist", false);
+    blacklistPrefs.begin("blacklist", false);
+    pendingPrefs.begin("pending", false);
+    Serial.println("StorageManager initialized with separate namespaces");
+  }
+  
+  // Read operations - mutex protected
+  bool isWhitelisted(String uid) {
+    if (xSemaphoreTake(nvsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      bool result = whitelistPrefs.isKey(uid.c_str());
+      xSemaphoreGive(nvsMutex);
+      return result;
+    }
+    return false;  // Fail-safe: deny if mutex unavailable
+  }
+  
+  bool isBlacklisted(String uid) {
+    if (xSemaphoreTake(nvsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      bool result = blacklistPrefs.isKey(uid.c_str());
+      xSemaphoreGive(nvsMutex);
+      return result;
+    }
+    return false;
+  }
+  
+  bool isPending(String uid) {
+    if (xSemaphoreTake(nvsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      bool result = pendingPrefs.isKey(uid.c_str());
+      xSemaphoreGive(nvsMutex);
+      return result;
+    }
+    return false;
+  }
+  
+  String getName(String uid, const char* listType) {
+    String result = "Unknown";
+    if (xSemaphoreTake(nvsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      if (strcmp(listType, "whitelist") == 0) {
+        result = whitelistPrefs.getString(uid.c_str(), "Unknown");
+      } else if (strcmp(listType, "blacklist") == 0) {
+        result = blacklistPrefs.getString(uid.c_str(), "Unknown");
+      } else if (strcmp(listType, "pending") == 0) {
+        result = pendingPrefs.getString(uid.c_str(), "Unknown");
+      }
+      xSemaphoreGive(nvsMutex);
+    }
+    return result;
+  }
+  
+  // Write operations - mutex protected
+  void addToWhitelist(String uid, String name) {
+    if (xSemaphoreTake(nvsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      whitelistPrefs.putString(uid.c_str(), name.c_str());
+      xSemaphoreGive(nvsMutex);
+    }
+  }
+  
+  void addToBlacklist(String uid, String name) {
+    if (xSemaphoreTake(nvsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      blacklistPrefs.putString(uid.c_str(), name.c_str());
+      xSemaphoreGive(nvsMutex);
+    }
+  }
+  
+  void addToPending(String uid, String name) {
+    if (xSemaphoreTake(nvsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      pendingPrefs.putString(uid.c_str(), name.c_str());
+      xSemaphoreGive(nvsMutex);
+    }
+  }
+  
+  void removeFromWhitelist(String uid) {
+    if (xSemaphoreTake(nvsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      whitelistPrefs.remove(uid.c_str());
+      xSemaphoreGive(nvsMutex);
+    }
+  }
+  
+  void removeFromBlacklist(String uid) {
+    if (xSemaphoreTake(nvsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      blacklistPrefs.remove(uid.c_str());
+      xSemaphoreGive(nvsMutex);
+    }
+  }
+  
+  void removeFromPending(String uid) {
+    if (xSemaphoreTake(nvsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      pendingPrefs.remove(uid.c_str());
+      xSemaphoreGive(nvsMutex);
+    }
+  }
+  
+  void clearAll() {
+    if (xSemaphoreTake(nvsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+      whitelistPrefs.clear();
+      blacklistPrefs.clear();
+      pendingPrefs.clear();
+      xSemaphoreGive(nvsMutex);
+    }
+  }
+}
+
 // ==================== CLOUD SERVICE MODULE (CORE 0) ====================
-// IMPORTANT: Cloud is COMMAND-BASED ONLY - NVS is authoritative!
-// Cloud can: add, delete, move, rename, unlock, request logs
-// Cloud CANNOT: overwrite lists, resync full JSON, rebuild local state
 namespace CloudService {
   unsigned long lastStatusUpdate = 0;
+  unsigned long lastFirebaseSync = 0;
   bool firebaseReady = false;
   
   void updateDeviceStatus() {
@@ -147,7 +266,6 @@ namespace CloudService {
     json.set("rssi", WiFi.RSSI());
     json.set("freeHeap", ESP.getFreeHeap());
     json.set("uptime", millis() / 1000);
-    json.set("mode", "nvs-authoritative");
     
     if (Firebase.RTDB.setJSON(&fbdo, statusPath, &json)) {
       Serial.println("Device status updated");
@@ -173,7 +291,7 @@ namespace CloudService {
       String logPath = logsPath + "/" + logKey;
       
       if (Firebase.RTDB.setJSON(&fbdo, logPath, &json)) {
-        Serial.println("Log mirrored to Firebase");
+        Serial.println("Log uploaded to Firebase");
       }
     }
   }
@@ -190,33 +308,38 @@ namespace CloudService {
       String path = pendingPath + "/" + String(pendingEntry.uid);
       
       if (Firebase.RTDB.setJSON(&fbdo, path, &json)) {
-        Serial.println("Pending mirrored to Firebase: " + String(pendingEntry.uid));
+        Serial.println("Added to pending in Firebase: " + String(pendingEntry.uid));
       }
     }
   }
   
-  // Mirror a single user change to Firebase (audit trail only)
-  void mirrorUserToFirebase(String uid, String name, String listType, bool isDelete) {
-    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
-    
-    String path;
-    if (listType == "whitelist") path = whitelistPath;
-    else if (listType == "blacklist") path = blacklistPath;
-    else if (listType == "pending") path = pendingPath;
-    else return;
-    
-    path += "/" + uid;
-    
-    if (isDelete) {
-      Firebase.RTDB.deleteNode(&fbdo, path);
-      Serial.println("Deleted from Firebase mirror: " + uid);
-    } else {
-      FirebaseJson json;
-      json.set("name", name);
-      json.set("updatedAt", getISOTimestamp());
-      Firebase.RTDB.setJSON(&fbdo, path, &json);
-      Serial.println("Mirrored to Firebase: " + uid + " -> " + listType);
+  // Input validation constants
+  const int MAX_UID_LENGTH = 16;   // RFID UIDs are typically 4-10 hex chars
+  const int MAX_NAME_LENGTH = 45;  // Leave margin for LogEntry.name[50]
+  
+  // Validate and sanitize UID
+  bool isValidUID(const String& uid) {
+    if (uid.length() == 0 || uid.length() > MAX_UID_LENGTH) return false;
+    // Only allow hex characters
+    for (unsigned int i = 0; i < uid.length(); i++) {
+      char c = uid.charAt(i);
+      if (!isxdigit(c)) return false;
     }
+    return true;
+  }
+  
+  // Validate and sanitize name
+  String sanitizeName(const String& name) {
+    String sanitized = name;
+    if (sanitized.length() > MAX_NAME_LENGTH) {
+      sanitized = sanitized.substring(0, MAX_NAME_LENGTH);
+    }
+    return sanitized;
+  }
+  
+  // Validate list name
+  bool isValidList(const String& list) {
+    return (list == "whitelist" || list == "blacklist" || list == "pending");
   }
   
   void checkCommands() {
@@ -227,12 +350,20 @@ namespace CloudService {
     lastCheck = millis();
     
     // Check unlock command
+    // NOTE: Stream callback is disabled for unlock to prevent duplicate execution
     if (Firebase.RTDB.getJSON(&fbdo, commandsPath + "/unlock")) {
       FirebaseJson json = fbdo.jsonObject();
       FirebaseJsonData result;
       
       if (json.get(result, "duration")) {
         int duration = result.intValue;
+        
+        // DELETE FIRST to prevent duplicate execution on failure/reboot
+        if (!Firebase.RTDB.deleteNode(&fbdo, commandsPath + "/unlock")) {
+          Serial.println("Failed to delete unlock command - skipping to prevent duplicate");
+          return;  // Don't execute if we can't delete (prevents duplicates)
+        }
+        
         if (duration > 0 && duration <= 300) {
           Command cmd;
           cmd.type = Command::UNLOCK;
@@ -242,134 +373,211 @@ namespace CloudService {
             xQueueSend(commandQueue, &cmd, 0);
             Serial.println("Unlock command queued for Core 1");
           }
-          
-          Firebase.RTDB.deleteNode(&fbdo, commandsPath + "/unlock");
         }
       }
     }
     
-    // Check manage command (add/delete/move/rename)
-    if (Firebase.RTDB.getJSON(&fbdo, commandsPath + "/manage")) {
+    // Check add command (cloud requests to add a user)
+    if (Firebase.RTDB.getJSON(&fbdo, commandsPath + "/add")) {
       FirebaseJson json = fbdo.jsonObject();
-      FirebaseJsonData actionData, uidData, fromData, toData, nameData;
+      FirebaseJsonData listData, uidData, nameData;
       
-      if (json.get(actionData, "action") && json.get(uidData, "uid")) {
-        String action = actionData.stringValue;
+      if (json.get(listData, "list") && json.get(uidData, "uid")) {
+        String list = listData.stringValue;
         String uid = uidData.stringValue;
+        String name = "Unknown";
+        if (json.get(nameData, "name")) name = sanitizeName(nameData.stringValue);
         
-        if (action == "add") {
-          // Add user to a list
-          json.get(toData, "to");
-          json.get(nameData, "name");
-          String toList = toData.stringValue;
-          String name = nameData.stringValue.length() > 0 ? nameData.stringValue : "Unknown";
-          
-          if (toList == "whitelist") {
-            StorageManager::addToWhitelist(uid, name);
-            mirrorUserToFirebase(uid, name, "whitelist", false);
-          } else if (toList == "blacklist") {
-            StorageManager::addToBlacklist(uid, name);
-            mirrorUserToFirebase(uid, name, "blacklist", false);
-          }
-          Serial.println("CMD: Added " + uid + " to " + toList);
-          
-        } else if (action == "delete") {
-          // Delete user from a list
-          json.get(fromData, "from");
-          String fromList = fromData.stringValue;
-          
-          if (fromList == "whitelist") {
-            StorageManager::removeFromWhitelist(uid);
-            mirrorUserToFirebase(uid, "", "whitelist", true);
-          } else if (fromList == "blacklist") {
-            StorageManager::removeFromBlacklist(uid);
-            mirrorUserToFirebase(uid, "", "blacklist", true);
-          } else if (fromList == "pending") {
-            StorageManager::removeFromPending(uid);
-            mirrorUserToFirebase(uid, "", "pending", true);
-          }
-          Serial.println("CMD: Deleted " + uid + " from " + fromList);
-          
-        } else if (action == "move") {
-          // Move user between lists
-          json.get(fromData, "from");
-          json.get(toData, "to");
-          json.get(nameData, "name");
-          String fromList = fromData.stringValue;
-          String toList = toData.stringValue;
-          String name = nameData.stringValue;
-          
-          // Get name from source if not provided
-          if (name.length() == 0) {
-            name = StorageManager::getName(uid, fromList.c_str());
-          }
-          
-          // Remove from source
-          if (fromList == "whitelist") {
-            StorageManager::removeFromWhitelist(uid);
-            mirrorUserToFirebase(uid, "", "whitelist", true);
-          } else if (fromList == "blacklist") {
-            StorageManager::removeFromBlacklist(uid);
-            mirrorUserToFirebase(uid, "", "blacklist", true);
-          } else if (fromList == "pending") {
-            StorageManager::removeFromPending(uid);
-            mirrorUserToFirebase(uid, "", "pending", true);
-          }
-          
-          // Add to destination
-          if (toList == "whitelist") {
-            StorageManager::addToWhitelist(uid, name);
-            mirrorUserToFirebase(uid, name, "whitelist", false);
-          } else if (toList == "blacklist") {
-            StorageManager::addToBlacklist(uid, name);
-            mirrorUserToFirebase(uid, name, "blacklist", false);
-          } else if (toList == "pending") {
-            StorageManager::addToPending(uid, name);
-            mirrorUserToFirebase(uid, name, "pending", false);
-          }
-          Serial.println("CMD: Moved " + uid + " from " + fromList + " to " + toList);
-          
-        } else if (action == "rename") {
-          // Rename user in a list
-          json.get(fromData, "list");
-          json.get(nameData, "name");
-          String listName = fromData.stringValue;
-          String newName = nameData.stringValue;
-          
-          if (listName == "whitelist") {
-            if (StorageManager::isWhitelisted(uid)) {
-              StorageManager::addToWhitelist(uid, newName);  // Overwrites with new name
-              mirrorUserToFirebase(uid, newName, "whitelist", false);
-            }
-          } else if (listName == "blacklist") {
-            if (StorageManager::isBlacklisted(uid)) {
-              StorageManager::addToBlacklist(uid, newName);
-              mirrorUserToFirebase(uid, newName, "blacklist", false);
-            }
-          } else if (listName == "pending") {
-            if (StorageManager::isPending(uid)) {
-              StorageManager::addToPending(uid, newName);
-              mirrorUserToFirebase(uid, newName, "pending", false);
-            }
-          }
-          Serial.println("CMD: Renamed " + uid + " to " + newName);
+        // DELETE FIRST to prevent duplicate execution
+        if (!Firebase.RTDB.deleteNode(&fbdo, commandsPath + "/add")) {
+          Serial.println("Failed to delete add command - skipping");
+          return;
         }
         
-        // Delete the processed command
-        Firebase.RTDB.deleteNode(&fbdo, commandsPath + "/manage");
+        // Validate inputs
+        if (!isValidUID(uid) || !isValidList(list)) {
+          Serial.println("Invalid UID or list in add command");
+          return;
+        }
+        
+        // Apply to NVS (authoritative)
+        if (list == "whitelist") {
+          StorageManager::addToWhitelist(uid, name);
+          // Mirror to Firebase
+          FirebaseJson userJson;
+          userJson.set("name", name);
+          userJson.set("addedAt", getISOTimestamp());
+          Firebase.RTDB.setJSON(&fbdo, whitelistPath + "/" + uid, &userJson);
+        } else if (list == "blacklist") {
+          StorageManager::addToBlacklist(uid, name);
+          FirebaseJson userJson;
+          userJson.set("name", name);
+          userJson.set("addedAt", getISOTimestamp());
+          Firebase.RTDB.setJSON(&fbdo, blacklistPath + "/" + uid, &userJson);
+        } else if (list == "pending") {
+          StorageManager::addToPending(uid, name);
+          FirebaseJson userJson;
+          userJson.set("name", name);
+          userJson.set("firstSeen", getISOTimestamp());
+          Firebase.RTDB.setJSON(&fbdo, pendingPath + "/" + uid, &userJson);
+        }
+        Serial.println("Add command processed: " + uid + " -> " + list);
+      }
+    }
+    
+    // Check delete command
+    if (Firebase.RTDB.getJSON(&fbdo, commandsPath + "/delete")) {
+      FirebaseJson json = fbdo.jsonObject();
+      FirebaseJsonData listData, uidData;
+      
+      if (json.get(listData, "list") && json.get(uidData, "uid")) {
+        String list = listData.stringValue;
+        String uid = uidData.stringValue;
+        
+        // DELETE FIRST
+        if (!Firebase.RTDB.deleteNode(&fbdo, commandsPath + "/delete")) {
+          Serial.println("Failed to delete delete command - skipping");
+          return;
+        }
+        
+        // Validate inputs
+        if (!isValidUID(uid) || !isValidList(list)) {
+          Serial.println("Invalid UID or list in delete command");
+          return;
+        }
+        
+        // Apply to NVS (authoritative)
+        if (list == "whitelist") {
+          StorageManager::removeFromWhitelist(uid);
+          Firebase.RTDB.deleteNode(&fbdo, whitelistPath + "/" + uid);
+        } else if (list == "blacklist") {
+          StorageManager::removeFromBlacklist(uid);
+          Firebase.RTDB.deleteNode(&fbdo, blacklistPath + "/" + uid);
+        } else if (list == "pending") {
+          StorageManager::removeFromPending(uid);
+          Firebase.RTDB.deleteNode(&fbdo, pendingPath + "/" + uid);
+        }
+        Serial.println("Delete command processed: " + uid + " from " + list);
+      }
+    }
+    
+    // Check move command
+    if (Firebase.RTDB.getJSON(&fbdo, commandsPath + "/move")) {
+      FirebaseJson json = fbdo.jsonObject();
+      FirebaseJsonData fromData, toData, uidData, nameData;
+      
+      if (json.get(fromData, "from") && json.get(toData, "to") && json.get(uidData, "uid")) {
+        String fromList = fromData.stringValue;
+        String toList = toData.stringValue;
+        String uid = uidData.stringValue;
+        String name = "Unknown";
+        
+        // Get name from command or will get from source list after delete
+        if (json.get(nameData, "name")) {
+          name = sanitizeName(nameData.stringValue);
+        } else {
+          name = StorageManager::getName(uid, fromList.c_str());
+        }
+        
+        // DELETE FIRST
+        if (!Firebase.RTDB.deleteNode(&fbdo, commandsPath + "/move")) {
+          Serial.println("Failed to delete move command - skipping");
+          return;
+        }
+        
+        // Validate inputs
+        if (!isValidUID(uid) || !isValidList(fromList) || !isValidList(toList)) {
+          Serial.println("Invalid UID or list in move command");
+          return;
+        }
+        
+        // Remove from source (NVS + Firebase)
+        if (fromList == "whitelist") {
+          StorageManager::removeFromWhitelist(uid);
+          Firebase.RTDB.deleteNode(&fbdo, whitelistPath + "/" + uid);
+        } else if (fromList == "blacklist") {
+          StorageManager::removeFromBlacklist(uid);
+          Firebase.RTDB.deleteNode(&fbdo, blacklistPath + "/" + uid);
+        } else if (fromList == "pending") {
+          StorageManager::removeFromPending(uid);
+          Firebase.RTDB.deleteNode(&fbdo, pendingPath + "/" + uid);
+        }
+        
+        // Add to destination (NVS + Firebase)
+        if (toList == "whitelist") {
+          StorageManager::addToWhitelist(uid, name);
+          FirebaseJson userJson;
+          userJson.set("name", name);
+          userJson.set("addedAt", getISOTimestamp());
+          Firebase.RTDB.setJSON(&fbdo, whitelistPath + "/" + uid, &userJson);
+        } else if (toList == "blacklist") {
+          StorageManager::addToBlacklist(uid, name);
+          FirebaseJson userJson;
+          userJson.set("name", name);
+          userJson.set("addedAt", getISOTimestamp());
+          Firebase.RTDB.setJSON(&fbdo, blacklistPath + "/" + uid, &userJson);
+        } else if (toList == "pending") {
+          StorageManager::addToPending(uid, name);
+          FirebaseJson userJson;
+          userJson.set("name", name);
+          userJson.set("firstSeen", getISOTimestamp());
+          Firebase.RTDB.setJSON(&fbdo, pendingPath + "/" + uid, &userJson);
+        }
+        
+        Serial.println("Move command processed: " + uid + " from " + fromList + " to " + toList);
+      }
+    }
+    
+    // Check rename command
+    if (Firebase.RTDB.getJSON(&fbdo, commandsPath + "/rename")) {
+      FirebaseJson json = fbdo.jsonObject();
+      FirebaseJsonData listData, uidData, nameData;
+      
+      if (json.get(listData, "list") && json.get(uidData, "uid") && json.get(nameData, "name")) {
+        String list = listData.stringValue;
+        String uid = uidData.stringValue;
+        String newName = sanitizeName(nameData.stringValue);
+        
+        // DELETE FIRST
+        if (!Firebase.RTDB.deleteNode(&fbdo, commandsPath + "/rename")) {
+          Serial.println("Failed to delete rename command - skipping");
+          return;
+        }
+        
+        // Validate inputs
+        if (!isValidUID(uid) || !isValidList(list)) {
+          Serial.println("Invalid UID or list in rename command");
+          return;
+        }
+        
+        // Update NVS (authoritative) and mirror to Firebase
+        if (list == "whitelist") {
+          StorageManager::addToWhitelist(uid, newName);  // Overwrites existing
+          Firebase.RTDB.setString(&fbdo, whitelistPath + "/" + uid + "/name", newName);
+        } else if (list == "blacklist") {
+          StorageManager::addToBlacklist(uid, newName);
+          Firebase.RTDB.setString(&fbdo, blacklistPath + "/" + uid + "/name", newName);
+        } else if (list == "pending") {
+          StorageManager::addToPending(uid, newName);
+          Firebase.RTDB.setString(&fbdo, pendingPath + "/" + uid + "/name", newName);
+        }
+        
+        Serial.println("Rename command processed: " + uid + " -> " + newName);
       }
     }
   }
   
-  // Upload local NVS state to Firebase as audit mirror (one-time on connect)
-  // This does NOT sync FROM Firebase - NVS remains authoritative
-  void uploadLocalStateToFirebase() {
+  // Upload local NVS state to Firebase (one-way mirror, NVS is authoritative)
+  void mirrorNVSToFirebase() {
     if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
     
-    Serial.println("Uploading local NVS state to Firebase (audit mirror)...");
-    // Note: This only mirrors what's in NVS to Firebase for dashboard visibility
-    // The local NVS data is NOT modified - it remains the source of truth
-    Serial.println("NVS is authoritative - Firebase is audit mirror only");
+    Serial.println("Mirroring NVS to Firebase (NVS is authoritative)...");
+    // This is called on boot to ensure Firebase reflects NVS state
+    // Firebase is just a mirror/audit log, NOT authoritative
+    
+    // Note: Full mirror would require iterating NVS which is complex
+    // Instead, we update Firebase incrementally as changes happen
+    Serial.println("NVS is authoritative. Firebase updates happen incrementally.");
   }
 }
 
@@ -391,6 +599,11 @@ namespace AccessController {
   unsigned long lastUnlock = 0;
   const unsigned long COOLDOWN_MS = 3000;
   
+  // Exit sensor state for edge detection
+  bool lastExitSensorState = false;  // Previous sensor reading
+  bool exitSensorTriggered = false;  // Latched trigger state
+  const unsigned long EXIT_UNLOCK_DURATION = 3000;  // Same as RFID access
+  
   void activateRelay(unsigned long duration) {
     if (millis() - lastUnlock < COOLDOWN_MS) {
       Serial.println("Cooldown active, ignoring unlock");
@@ -410,6 +623,42 @@ namespace AccessController {
     buzzerActive = true;
     buzzerStartTime = millis();
     buzzerDuration = duration;
+  }
+  
+  // Exit sensor handling with edge-triggered, latched behavior
+  // Sensor is NC (Normally Closed): LOW=idle, HIGH=hand detected
+  void handleExitSensor() {
+    bool currentState = digitalRead(EXIT_SENSOR_PIN) == HIGH;
+    
+    // Edge detection: trigger only on LOW -> HIGH transition
+    if (currentState && !lastExitSensorState && !exitSensorTriggered) {
+      // Rising edge detected - hand just appeared
+      exitSensorTriggered = true;  // Latch the trigger
+      
+      // Unlock door (same duration as RFID)
+      activateRelay(EXIT_UNLOCK_DURATION);
+      activateBuzzer(100);  // Short confirmation beep
+      
+      Serial.println("EXIT SENSOR: Door unlocked (edge-triggered)");
+      
+      // Queue log for Core 0 (Firebase)
+      if (logQueue != NULL) {
+        LogEntry entry;
+        strcpy(entry.uid, "EXIT_SENSOR");
+        strcpy(entry.name, "Exit Button");
+        strcpy(entry.status, "granted");
+        strcpy(entry.type, "exit");
+        xQueueSend(logQueue, &entry, 0);
+      }
+    }
+    
+    // Reset latch when sensor returns to idle (hand removed)
+    // AND the relay timer has expired (door is locked again)
+    if (!currentState && !relayActive) {
+      exitSensorTriggered = false;
+    }
+    
+    lastExitSensorState = currentState;
   }
   
   void update() {
@@ -506,110 +755,26 @@ namespace AccessController {
   }
 }
 
-// ==================== STORAGE MANAGER MODULE ====================
-namespace StorageManager {
-  Preferences whitelistPrefs;
-  Preferences blacklistPrefs;
-  Preferences pendingPrefs;
-  
-  void init() {
-    whitelistPrefs.begin("whitelist", false);
-    blacklistPrefs.begin("blacklist", false);
-    pendingPrefs.begin("pending", false);
-    Serial.println("StorageManager initialized with separate namespaces");
-  }
-  
-  bool isWhitelisted(String uid) {
-    return whitelistPrefs.isKey(uid.c_str());
-  }
-  
-  bool isBlacklisted(String uid) {
-    return blacklistPrefs.isKey(uid.c_str());
-  }
-  
-  bool isPending(String uid) {
-    return pendingPrefs.isKey(uid.c_str());
-  }
-  
-  String getName(String uid, const char* listType) {
-    if (strcmp(listType, "whitelist") == 0) {
-      return whitelistPrefs.getString(uid.c_str(), "Unknown");
-    } else if (strcmp(listType, "blacklist") == 0) {
-      return blacklistPrefs.getString(uid.c_str(), "Unknown");
-    } else if (strcmp(listType, "pending") == 0) {
-      return pendingPrefs.getString(uid.c_str(), "Unknown");
-    }
-    return "Unknown";
-  }
-  
-  void addToWhitelist(String uid, String name) {
-    whitelistPrefs.putString(uid.c_str(), name.c_str());
-  }
-  
-  void addToBlacklist(String uid, String name) {
-    blacklistPrefs.putString(uid.c_str(), name.c_str());
-  }
-  
-  void addToPending(String uid, String name) {
-    pendingPrefs.putString(uid.c_str(), name.c_str());
-  }
-  
-  void removeFromWhitelist(String uid) {
-    whitelistPrefs.remove(uid.c_str());
-  }
-  
-  void removeFromBlacklist(String uid) {
-    blacklistPrefs.remove(uid.c_str());
-  }
-  
-  void removeFromPending(String uid) {
-    pendingPrefs.remove(uid.c_str());
-  }
-  
-  void clearAll() {
-    whitelistPrefs.clear();
-    blacklistPrefs.clear();
-    pendingPrefs.clear();
-  }
-}
-
 // ==================== FUNCTION DECLARATIONS ====================
+// LittleFS functions
 void initLittleFS();
 void saveLogToFile(String uid, String name, String status, String type);
 void cleanOldLogs();
 String getDateString();
 String getLogFilePath();
-void handleManageUser(String message);
-void sendLogsToCloud(String dateFilter);
-void sendAllListsToCloud();
-void moveUserBetweenLists(String uid, String fromList, String toList, String name);
-void deleteUserFromList(String uid, String listName);
-void renameUserInList(String uid, String listName, String newName);
 
 // WiFi and NTP functions
-void connectWiFi();
-void updateNTPTime();
+void handleWiFi();
+void initWiFi();
 String getISOTimestamp();
 
-// RFID and control functions
-void handleRFIDScan();
-void activateRelay(unsigned long duration);
-void activateBuzzer(unsigned long duration);
+// Logging
 void publishLog(String uid, String name, String status, String type);
-void initializeNVSIfNeeded();
 
 // Firebase functions
 void initFirebase();
-void syncListsFromFirebase();
-void syncListToNVS(String path, const char* nvsKey);
-void publishLogToFirebase(String uid, String name, String status, String type);
-void updateDeviceStatus();
-void checkFirebaseCommands();
 void streamCallback(FirebaseStream data);
 void streamTimeoutCallback(bool timeout);
-void uploadLocalListsToFirebase();
-void addToPendingFirebase(String uid);
-void addToPendingFirebaseInternal(String uid);
 
 // FreeRTOS task functions
 void firebaseTask(void *parameter);
@@ -624,6 +789,7 @@ void setup() {
   // Initialize GPIO
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(EXIT_SENSOR_PIN, INPUT);  // NC sensor: LOW=idle, HIGH=hand detected
   digitalWrite(RELAY_PIN, LOW);
   digitalWrite(BUZZER_PIN, LOW);
   
@@ -655,6 +821,12 @@ void setup() {
   logQueue = xQueueCreate(10, sizeof(LogEntry));
   pendingQueue = xQueueCreate(5, sizeof(PendingEntry));
   commandQueue = xQueueCreate(5, sizeof(Command));
+  
+  // Create mutex for thread-safe NVS access between cores
+  nvsMutex = xSemaphoreCreateMutex();
+  if (nvsMutex == NULL) {
+    Serial.println("ERROR: Failed to create NVS mutex!");
+  }
   
   // Create Firebase task on Core 0 (WiFi core)
   xTaskCreatePinnedToCore(
@@ -698,7 +870,8 @@ void firebaseTask(void *parameter) {
         if (!CloudService::firebaseReady) {
           CloudService::firebaseReady = true;
           Serial.println("Firebase connected!");
-          CloudService::syncListsFromFirebase();
+          // NVS is authoritative - we mirror TO Firebase, not FROM Firebase
+          CloudService::mirrorNVSToFirebase();
           CloudService::updateDeviceStatus();
         }
         
@@ -746,6 +919,10 @@ void rfidTask(void *parameter) {
     if (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
       AccessController::handleCommand(cmd);
     }
+    
+    // Check exit sensor (edge-triggered, latched)
+    // This works independently of WiFi/Firebase - fail-safe exit
+    AccessController::handleExitSensor();
     
     // Check for RFID card - this runs independently of Firebase/WiFi
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
@@ -813,27 +990,19 @@ void streamCallback(FirebaseStream data) {
   Serial.println("Path: " + data.dataPath());
   Serial.println("Type: " + data.dataType());
   
-  // Handle unlock command
-  if (data.dataPath().indexOf("unlock") >= 0 && data.dataType() == "json") {
-    FirebaseJson json = data.jsonObject();
-    FirebaseJsonData result;
-    
-    if (json.get(result, "duration")) {
-      int duration = result.intValue;
-      if (duration > 0 && duration <= 300) {
-        activateRelay(duration * 1000);
-        Serial.println("Remote unlock via stream: " + String(duration) + "s");
-        
-        // Clear the command after processing
-        Firebase.RTDB.deleteNode(&fbdo, commandsPath + "/unlock");
-      }
-    }
+  // NOTE: Unlock command is handled ONLY by polling in checkCommands()
+  // to prevent duplicate execution. Stream is used for immediate notification only.
+  if (data.dataPath().indexOf("unlock") >= 0) {
+    Serial.println("Unlock command detected via stream - will be processed by polling");
+    // Do NOT process here - let checkCommands() handle it with delete-first logic
   }
   
-  // Handle sync command
+  // Handle sync command - NVS is authoritative, so we mirror TO Firebase
   if (data.dataPath().indexOf("sync") >= 0) {
-    Serial.println("Sync command received");
-    syncListsFromFirebase();
+    Serial.println("Sync command received - NVS is authoritative");
+    // Do NOT overwrite NVS from Firebase
+    // Instead, mirror NVS to Firebase if needed
+    CloudService::mirrorNVSToFirebase();
   }
 }
 
@@ -1003,169 +1172,9 @@ void cleanOldLogs() {
 }
 
 // ==================== USER MANAGEMENT ====================
-/*
- * Handle user management commands from cloud
- * JSON format: {"action": "move", "uid": "ABCD1234", "from": "pending", "to": "whitelist", "name": "John Doe"}
- * Actions: move, delete, rename
- */
-void handleManageUser(String message) {
-  StaticJsonDocument<512> doc;
-  DeserializationError error = deserializeJson(doc, message);
-  
-  if (error) {
-    Serial.println("Failed to parse manage command");
-    return;
-  }
-  
-  String action = doc["action"].as<String>();
-  String uid = doc["uid"].as<String>();
-  
-  if (action == "move") {
-    String fromList = doc["from"].as<String>();
-    String toList = doc["to"].as<String>();
-    String name = doc["name"] | "Unknown";
-    moveUserBetweenLists(uid, fromList, toList, name);
-  }
-  else if (action == "delete") {
-    String fromList = doc["from"].as<String>();
-    deleteUserFromList(uid, fromList);
-  }
-  else if (action == "rename") {
-    String list = doc["list"].as<String>();
-    String newName = doc["name"].as<String>();
-    renameUserInList(uid, list, newName);
-  }
-  
-  // Sync updated lists to cloud
-  sendAllListsToCloud();
-}
-
-void moveUserBetweenLists(String uid, String fromList, String toList, String name) {
-  // Get the "from" list key
-  const char* fromKey = NULL;
-  if (fromList == "whitelist") fromKey = NVS_WHITELIST;
-  else if (fromList == "blacklist") fromKey = NVS_BLACKLIST;
-  else if (fromList == "pending") fromKey = NVS_PENDING;
-  
-  // Get the "to" list key
-  const char* toKey = NULL;
-  if (toList == "whitelist") toKey = NVS_WHITELIST;
-  else if (toList == "blacklist") toKey = NVS_BLACKLIST;
-  else if (toList == "pending") toKey = NVS_PENDING;
-  
-  if (!fromKey || !toKey) {
-    Serial.println("Invalid list name");
-    return;
-  }
-  
-  // Load both lists
-  String fromJson = prefs.getString(fromKey, "{}");
-  String toJson = prefs.getString(toKey, "{}");
-  
-  StaticJsonDocument<1024> fromDoc;
-  StaticJsonDocument<1024> toDoc;
-  
-  deserializeJson(fromDoc, fromJson);
-  deserializeJson(toDoc, toJson);
-  
-  // Get name from source list if not provided
-  if (name == "Unknown" && fromDoc.containsKey(uid)) {
-    name = fromDoc[uid].as<String>();
-  }
-  
-  // Remove from source
-  fromDoc.remove(uid);
-  
-  // Add to destination
-  toDoc[uid] = name;
-  
-  // Save both lists
-  String updatedFrom, updatedTo;
-  serializeJson(fromDoc, updatedFrom);
-  serializeJson(toDoc, updatedTo);
-  
-  prefs.putString(fromKey, updatedFrom);
-  prefs.putString(toKey, updatedTo);
-  
-  Serial.println("Moved " + uid + " (" + name + ") from " + fromList + " to " + toList);
-  
-  // Log the action
-  publishLog(uid, name, "moved_to_" + toList, "management");
-}
-
-void deleteUserFromList(String uid, String listName) {
-  const char* listKey = NULL;
-  String firebasePath = "";
-  
-  if (listName == "whitelist") {
-    listKey = NVS_WHITELIST;
-    firebasePath = whitelistPath;
-  } else if (listName == "blacklist") {
-    listKey = NVS_BLACKLIST;
-    firebasePath = blacklistPath;
-  } else if (listName == "pending") {
-    listKey = NVS_PENDING;
-    firebasePath = pendingPath;
-  }
-  
-  if (!listKey) return;
-  
-  String listJson = prefs.getString(listKey, "{}");
-  StaticJsonDocument<1024> doc;
-  deserializeJson(doc, listJson);
-  
-  String name = doc[uid] | "Unknown";
-  doc.remove(uid);
-  
-  String updated;
-  serializeJson(doc, updated);
-  prefs.putString(listKey, updated);
-  
-  // Delete from Firebase
-  if (Firebase.ready()) {
-    Firebase.RTDB.deleteNode(&fbdo, firebasePath + "/" + uid);
-  }
-  
-  Serial.println("Deleted " + uid + " from " + listName);
-  publishLog(uid, name, "deleted_from_" + listName, "management");
-}
-
-void renameUserInList(String uid, String listName, String newName) {
-  const char* listKey = NULL;
-  String firebasePath = "";
-  
-  if (listName == "whitelist") {
-    listKey = NVS_WHITELIST;
-    firebasePath = whitelistPath;
-  } else if (listName == "blacklist") {
-    listKey = NVS_BLACKLIST;
-    firebasePath = blacklistPath;
-  } else if (listName == "pending") {
-    listKey = NVS_PENDING;
-    firebasePath = pendingPath;
-  }
-  
-  if (!listKey) return;
-  
-  String listJson = prefs.getString(listKey, "{}");
-  StaticJsonDocument<1024> doc;
-  deserializeJson(doc, listJson);
-  
-  if (doc.containsKey(uid)) {
-    doc[uid] = newName;
-    
-    String updated;
-    serializeJson(doc, updated);
-    prefs.putString(listKey, updated);
-    
-    // Update in Firebase
-    if (Firebase.ready()) {
-      Firebase.RTDB.setString(&fbdo, firebasePath + "/" + uid + "/name", newName);
-    }
-    
-    Serial.println("Renamed " + uid + " to " + newName + " in " + listName);
-  }
-}
+// NOTE: Legacy functions removed. All user management is now handled via
+// Firebase commands in CloudService::checkCommands()
+// Commands: add, delete, move, rename
 
 // ==================== CLOUD SYNC FUNCTIONS (kept for local backup) ====================
 void sendAllListsToCloud() {
