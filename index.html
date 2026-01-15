@@ -597,6 +597,27 @@
         .logs-card .card-body {
             max-height: 500px;
         }
+        
+        /* Sync button animation */
+        .fa-spin {
+            animation: spin 1s linear infinite;
+        }
+        
+        /* Card highlight animation */
+        .card {
+            transition: box-shadow 0.3s ease;
+        }
+        
+        /* Real-time update flash */
+        @keyframes flash {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .user-item.new {
+            animation: flash 0.5s ease-in-out;
+            background: rgba(99, 102, 241, 0.2);
+        }
     </style>
 </head>
 <body>
@@ -612,6 +633,9 @@
                 <span class="status-badge" style="background: rgba(99, 102, 241, 0.2); color: var(--primary); font-size: 0.75rem;">
                     <i class="fas fa-database"></i> NVS Authoritative
                 </span>
+                <button class="btn btn-warning" onclick="syncNow()" id="syncBtn">
+                    <i class="fas fa-sync-alt"></i> Sync Now
+                </button>
                 <button class="btn btn-primary" onclick="remoteUnlock()">
                     <i class="fas fa-unlock"></i> Remote Unlock
                 </button>
@@ -822,83 +846,173 @@
                 initializeListeners();
             });
 
+        // ==================== DATA STORES ====================
+        let whitelistData = {};
+        let blacklistData = {};
+        let pendingData = {};
+        let listenersInitialized = false;
+        
         // ==================== REAL-TIME LISTENERS ====================
         function initializeListeners() {
-            console.log("Initializing listeners for path:", basePath);
-            console.log("Full status path:", `${basePath}/status`);
+            if (listenersInitialized) {
+                console.log("Listeners already initialized, skipping...");
+                return;
+            }
+            listenersInitialized = true;
             
-            // Device Status
+            console.log("Initializing listeners for path:", basePath);
+            
+            // Device Status - real-time
             database.ref(`${basePath}/status`).on('value', snapshot => {
                 const status = snapshot.val();
-                console.log("Status data received:", status);
+                console.log("Status update:", status);
                 updateDeviceStatus(status);
             }, error => {
                 console.error("Status listener error:", error.code, error.message);
             });
 
-            // Whitelist
-            database.ref(`${basePath}/whitelist`).on('value', snapshot => {
-                const data = snapshot.val() || {};
-                console.log("Whitelist data:", data);
-                renderUserList('whitelistList', data, 'whitelist');
-                document.getElementById('whitelistCount').textContent = Object.keys(data).length;
-            }, error => {
-                console.error("Whitelist listener error:", error);
+            // Whitelist - real-time with child events for instant updates
+            const whitelistRef = database.ref(`${basePath}/whitelist`);
+            whitelistRef.on('value', snapshot => {
+                whitelistData = snapshot.val() || {};
+                console.log("Whitelist full sync:", Object.keys(whitelistData).length, "entries");
+                renderUserList('whitelistList', whitelistData, 'whitelist');
+                document.getElementById('whitelistCount').textContent = Object.keys(whitelistData).length;
             });
 
-            // Blacklist
-            database.ref(`${basePath}/blacklist`).on('value', snapshot => {
-                const data = snapshot.val() || {};
-                console.log("Blacklist data:", data);
-                renderUserList('blacklistList', data, 'blacklist');
-                document.getElementById('blacklistCount').textContent = Object.keys(data).length;
-            }, error => {
-                console.error("Blacklist listener error:", error);
+            // Blacklist - real-time
+            const blacklistRef = database.ref(`${basePath}/blacklist`);
+            blacklistRef.on('value', snapshot => {
+                blacklistData = snapshot.val() || {};
+                console.log("Blacklist full sync:", Object.keys(blacklistData).length, "entries");
+                renderUserList('blacklistList', blacklistData, 'blacklist');
+                document.getElementById('blacklistCount').textContent = Object.keys(blacklistData).length;
             });
 
-            // Pending
-            database.ref(`${basePath}/pending`).on('value', snapshot => {
-                const data = snapshot.val() || {};
-                console.log("Pending data:", data);
-                renderPendingList(data);
-                document.getElementById('pendingCount').textContent = Object.keys(data).length;
-                document.getElementById('pendingBadge').textContent = Object.keys(data).length;
-            }, error => {
-                console.error("Pending listener error:", error);
+            // Pending - real-time
+            const pendingRef = database.ref(`${basePath}/pending`);
+            pendingRef.on('value', snapshot => {
+                pendingData = snapshot.val() || {};
+                console.log("Pending full sync:", Object.keys(pendingData).length, "entries");
+                renderPendingList(pendingData);
+                document.getElementById('pendingCount').textContent = Object.keys(pendingData).length;
+                document.getElementById('pendingBadge').textContent = Object.keys(pendingData).length;
+                
+                // Play notification sound for new pending cards
+                if (Object.keys(pendingData).length > 0) {
+                    document.getElementById('pendingBadge').style.animation = 'pulse 0.5s ease-in-out 3';
+                }
             });
 
-            // Logs (last 30 days)
-            const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
-            database.ref(`${basePath}/logs`)
-                .orderByKey()
-                .startAt(String(Math.floor(thirtyDaysAgo / 1000)))
-                .on('value', snapshot => {
-                    const data = snapshot.val() || {};
-                    console.log("Logs data:", data);
-                    allLogs = Object.entries(data).map(([key, value]) => ({
-                        id: key,
-                        ...value
-                    })).reverse();
+            // Logs - use child_added for real-time new log entries
+            const logsRef = database.ref(`${basePath}/logs`);
+            
+            // Initial load - get all logs
+            logsRef.orderByKey().limitToLast(500).once('value', snapshot => {
+                const data = snapshot.val() || {};
+                console.log("Logs initial load:", Object.keys(data).length, "entries");
+                allLogs = Object.entries(data).map(([key, value]) => ({
+                    id: key,
+                    ...value
+                })).sort((a, b) => {
+                    // Sort by time descending (newest first)
+                    const timeA = new Date(a.time).getTime();
+                    const timeB = new Date(b.time).getTime();
+                    return timeB - timeA;
+                });
+                document.getElementById('logsCount').textContent = allLogs.length;
+                renderLogs();
+            });
+            
+            // Listen for new logs added in real-time
+            logsRef.orderByKey().limitToLast(1).on('child_added', snapshot => {
+                const newLog = { id: snapshot.key, ...snapshot.val() };
+                
+                // Check if this log already exists
+                const exists = allLogs.some(log => log.id === newLog.id);
+                if (!exists) {
+                    console.log("New log entry:", newLog);
+                    allLogs.unshift(newLog);  // Add to beginning
                     document.getElementById('logsCount').textContent = allLogs.length;
                     renderLogs();
-                }, error => {
-                    console.error("Logs listener error:", error);
-                });
+                    
+                    // Flash the logs section
+                    const logsCard = document.querySelector('.logs-card');
+                    logsCard.style.boxShadow = '0 0 20px rgba(99, 102, 241, 0.5)';
+                    setTimeout(() => logsCard.style.boxShadow = '', 1000);
+                }
+            });
+            
+            // Listen for command errors
+            database.ref(`${basePath}/commandErrors`).orderByKey().limitToLast(1).on('child_added', snapshot => {
+                const error = snapshot.val();
+                if (error && error.command) {
+                    console.error("Command error from device:", error);
+                    showToast(`Command failed: ${error.command} - ${error.error}`, 'error');
+                }
+            });
         }
         
-        // Debug: Also try reading the data once directly to see raw structure
-        function debugReadData() {
-            database.ref(basePath).once('value')
-                .then(snapshot => {
-                    console.log("=== FULL DATABASE STRUCTURE ===");
-                    console.log(JSON.stringify(snapshot.val(), null, 2));
-                })
-                .catch(error => {
-                    console.error("Debug read error:", error);
-                });
+        // ==================== SYNC NOW FUNCTION ====================
+        async function syncNow() {
+            const syncBtn = document.getElementById('syncBtn');
+            syncBtn.innerHTML = '<i class="fas fa-sync-alt fa-spin"></i> Syncing...';
+            syncBtn.disabled = true;
+            
+            try {
+                console.log("Force syncing from cloud...");
+                
+                // Fetch all data fresh from Firebase
+                const snapshot = await database.ref(basePath).once('value');
+                const data = snapshot.val() || {};
+                
+                console.log("=== FULL DATABASE SYNC ===");
+                console.log(JSON.stringify(data, null, 2));
+                
+                // Update all data stores
+                whitelistData = data.whitelist || {};
+                blacklistData = data.blacklist || {};
+                pendingData = data.pending || {};
+                
+                // Re-render all lists
+                renderUserList('whitelistList', whitelistData, 'whitelist');
+                document.getElementById('whitelistCount').textContent = Object.keys(whitelistData).length;
+                
+                renderUserList('blacklistList', blacklistData, 'blacklist');
+                document.getElementById('blacklistCount').textContent = Object.keys(blacklistData).length;
+                
+                renderPendingList(pendingData);
+                document.getElementById('pendingCount').textContent = Object.keys(pendingData).length;
+                document.getElementById('pendingBadge').textContent = Object.keys(pendingData).length;
+                
+                // Update status
+                if (data.status) {
+                    updateDeviceStatus(data.status);
+                }
+                
+                // Update logs
+                if (data.logs) {
+                    allLogs = Object.entries(data.logs).map(([key, value]) => ({
+                        id: key,
+                        ...value
+                    })).sort((a, b) => {
+                        const timeA = new Date(a.time).getTime();
+                        const timeB = new Date(b.time).getTime();
+                        return timeB - timeA;
+                    });
+                    document.getElementById('logsCount').textContent = allLogs.length;
+                    renderLogs();
+                }
+                
+                showToast('Sync complete! All data refreshed from cloud.', 'success');
+            } catch (error) {
+                console.error("Sync error:", error);
+                showToast('Sync failed: ' + error.message, 'error');
+            } finally {
+                syncBtn.innerHTML = '<i class="fas fa-sync-alt"></i> Sync Now';
+                syncBtn.disabled = false;
+            }
         }
-        // Call debug function
-        setTimeout(debugReadData, 2000);
 
         // ==================== UPDATE DEVICE STATUS ====================
         function updateDeviceStatus(status) {
@@ -932,6 +1046,16 @@
         }
 
         // ==================== RENDER FUNCTIONS ====================
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text || '';
+            return div.innerHTML;
+        }
+        
+        function escapeAttr(text) {
+            return (text || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        }
+        
         function renderUserList(containerId, data, listType) {
             const container = document.getElementById(containerId);
             const entries = Object.entries(data);
@@ -947,20 +1071,22 @@
             }
 
             container.innerHTML = entries.map(([uid, userData]) => {
-                const name = typeof userData === 'object' ? userData.name : userData;
+                const name = typeof userData === 'object' ? (userData.name || 'Unknown') : (userData || 'Unknown');
+                const safeName = escapeHtml(name);
+                const safeNameAttr = escapeAttr(name);
                 const initials = name.substring(0, 2).toUpperCase();
                 
                 return `
                     <div class="user-item">
                         <div class="user-info">
-                            <div class="user-avatar">${initials}</div>
+                            <div class="user-avatar">${escapeHtml(initials)}</div>
                             <div class="user-details">
-                                <h4>${name}</h4>
-                                <span>${uid}</span>
+                                <h4>${safeName}</h4>
+                                <span>${escapeHtml(uid)}</span>
                             </div>
                         </div>
                         <div class="user-actions">
-                            <button class="btn btn-icon btn-warning" onclick="editUser('${uid}', '${name}', '${listType}')" title="Edit">
+                            <button class="btn btn-icon btn-warning" onclick="editUser('${uid}', '${safeNameAttr}', '${listType}')" title="Edit">
                                 <i class="fas fa-edit"></i>
                             </button>
                             ${listType === 'whitelist' ? `
@@ -996,16 +1122,18 @@
             }
 
             container.innerHTML = entries.map(([uid, userData]) => {
-                const name = typeof userData === 'object' ? userData.name : userData;
-                const firstSeen = userData.firstSeen ? new Date(userData.firstSeen).toLocaleString() : 'Unknown';
+                const name = typeof userData === 'object' ? (userData.name || 'Unknown') : (userData || 'Unknown');
+                const safeName = escapeHtml(name);
+                const firstSeen = userData && userData.firstSeen ? new Date(userData.firstSeen).toLocaleString() : 'Unknown';
                 
                 return `
                     <div class="user-item">
                         <div class="user-info">
                             <div class="user-avatar">?</div>
                             <div class="user-details">
-                                <h4>${name}</h4>
-                                <span>${uid}</span>
+                                <h4>${safeName}</h4>
+                                <span>${escapeHtml(uid)}</span>
+                                <br><small style="color: var(--gray);">First seen: ${escapeHtml(firstSeen)}</small>
                             </div>
                         </div>
                         <div class="user-actions">
@@ -1024,7 +1152,20 @@
         function renderLogs() {
             const container = document.getElementById('logsList');
             
-            let filteredLogs = allLogs;
+            let filteredLogs = [...allLogs];  // Create a copy to avoid modifying original
+            
+            // Filter by date
+            if (currentDateFilter) {
+                const selectedDate = new Date(currentDateFilter).toISOString().split('T')[0];
+                filteredLogs = filteredLogs.filter(log => {
+                    try {
+                        const logDate = new Date(log.time).toISOString().split('T')[0];
+                        return logDate === selectedDate;
+                    } catch (e) {
+                        return false;
+                    }
+                });
+            }
             
             // Filter by status
             if (currentLogFilter !== 'all') {
@@ -1067,7 +1208,10 @@
                 }
                 
                 const time = new Date(log.time);
-                const typeLabel = log.type === 'exit' ? 'Exit Sensor' : log.type;
+                const typeLabel = log.type === 'exit' ? 'Exit Sensor' : (log.type || 'rfid');
+                const safeName = escapeHtml(log.name || 'Unknown');
+                const safeUid = escapeHtml(log.uid || 'Unknown');
+                const safeStatus = escapeHtml(log.status || 'unknown').toUpperCase();
                 
                 return `
                     <div class="log-entry">
@@ -1075,11 +1219,11 @@
                             <i class="fas ${icon}"></i>
                         </div>
                         <div class="log-details">
-                            <h4>${log.name} - ${log.status.toUpperCase()}</h4>
+                            <h4>${safeName} - ${safeStatus}</h4>
                             <div class="log-meta">
-                                <span><i class="fas fa-id-card"></i> ${log.uid}</span>
+                                <span><i class="fas fa-id-card"></i> ${safeUid}</span>
                                 <span><i class="fas fa-clock"></i> ${time.toLocaleString()}</span>
-                                <span><i class="fas fa-tag"></i> ${typeLabel}</span>
+                                <span><i class="fas fa-tag"></i> ${escapeHtml(typeLabel)}</span>
                             </div>
                         </div>
                     </div>
@@ -1092,73 +1236,109 @@
         // ESP32 processes commands, updates NVS, then mirrors to Firebase.
         
         async function approvePending(uid) {
-            const namePrompt = prompt("Enter name for this user:", "Unknown");
-            if (!namePrompt) return;
+            // Get current name from pending data
+            const currentData = pendingData[uid] || {};
+            const currentName = typeof currentData === 'object' ? currentData.name : currentData;
+            
+            const namePrompt = prompt("Enter name for this user:", currentName || "Unknown");
+            if (namePrompt === null) return;  // User cancelled
             
             // Sanitize name to match ESP32 limits
-            const sanitizedName = sanitizeName(namePrompt);
+            const sanitizedName = sanitizeName(namePrompt) || 'Unknown';
 
             try {
+                console.log(`Approving ${uid} with name: ${sanitizedName}`);
+                
                 // Send move command to ESP32 (pending -> whitelist)
                 await database.ref(`${basePath}/commands/move`).set({
                     from: 'pending',
                     to: 'whitelist',
-                    uid: uid,
+                    uid: uid.toUpperCase(),
                     name: sanitizedName,
                     timestamp: Date.now()
                 });
                 
                 showToast(`Command sent: Approve ${sanitizedName}`, 'success');
+                
+                // Optimistic UI update - will be corrected by real-time listener
+                delete pendingData[uid];
+                renderPendingList(pendingData);
+                document.getElementById('pendingCount').textContent = Object.keys(pendingData).length;
+                document.getElementById('pendingBadge').textContent = Object.keys(pendingData).length;
             } catch (error) {
-                showToast('Error sending approve command', 'error');
+                showToast('Error sending approve command: ' + error.message, 'error');
                 console.error(error);
             }
         }
 
         async function denyPending(uid) {
-            if (!confirm('Move this card to blacklist?')) return;
+            const action = confirm('Move this card to blacklist?\n\nClick OK to blacklist, or Cancel to just delete.');
 
             try {
-                // Get name from pending list for the command
-                const snapshot = await database.ref(`${basePath}/pending/${uid}`).get();
-                const userData = snapshot.val() || { name: 'Unknown' };
+                // Get name from local pending data
+                const userData = pendingData[uid] || { name: 'Unknown' };
                 const name = typeof userData === 'object' ? userData.name : userData;
                 
-                // Send move command to ESP32 (pending -> blacklist)
-                await database.ref(`${basePath}/commands/move`).set({
-                    from: 'pending',
-                    to: 'blacklist',
-                    uid: uid,
-                    name: name,
-                    timestamp: Date.now()
-                });
+                if (action) {
+                    // Move to blacklist
+                    console.log(`Denying ${uid} - moving to blacklist`);
+                    await database.ref(`${basePath}/commands/move`).set({
+                        from: 'pending',
+                        to: 'blacklist',
+                        uid: uid.toUpperCase(),
+                        name: name,
+                        timestamp: Date.now()
+                    });
+                    showToast('Command sent: Deny and blacklist', 'success');
+                } else {
+                    // Just delete from pending
+                    console.log(`Deleting ${uid} from pending`);
+                    await database.ref(`${basePath}/commands/delete`).set({
+                        list: 'pending',
+                        uid: uid.toUpperCase(),
+                        timestamp: Date.now()
+                    });
+                    showToast('Command sent: Delete from pending', 'success');
+                }
                 
-                showToast('Command sent: Deny and blacklist', 'success');
+                // Optimistic UI update
+                delete pendingData[uid];
+                renderPendingList(pendingData);
+                document.getElementById('pendingCount').textContent = Object.keys(pendingData).length;
+                document.getElementById('pendingBadge').textContent = Object.keys(pendingData).length;
             } catch (error) {
-                showToast('Error sending deny command', 'error');
+                showToast('Error sending command: ' + error.message, 'error');
                 console.error(error);
             }
         }
 
         async function moveUser(uid, fromList, toList) {
+            if (!confirm(`Move this user from ${fromList} to ${toList}?`)) return;
+            
             try {
-                // Get name from source list for the command
-                const snapshot = await database.ref(`${basePath}/${fromList}/${uid}`).get();
-                const userData = snapshot.val() || { name: 'Unknown' };
+                // Get name from local data store
+                let userData;
+                if (fromList === 'whitelist') userData = whitelistData[uid];
+                else if (fromList === 'blacklist') userData = blacklistData[uid];
+                else if (fromList === 'pending') userData = pendingData[uid];
+                
+                userData = userData || { name: 'Unknown' };
                 const name = typeof userData === 'object' ? userData.name : userData;
+                
+                console.log(`Moving ${uid} (${name}) from ${fromList} to ${toList}`);
                 
                 // Send move command to ESP32
                 await database.ref(`${basePath}/commands/move`).set({
                     from: fromList,
                     to: toList,
-                    uid: uid,
+                    uid: uid.toUpperCase(),
                     name: name,
                     timestamp: Date.now()
                 });
                 
                 showToast(`Command sent: Move to ${toList}`, 'success');
             } catch (error) {
-                showToast('Error sending move command', 'error');
+                showToast('Error sending move command: ' + error.message, 'error');
                 console.error(error);
             }
         }
@@ -1167,16 +1347,18 @@
             if (!confirm('Are you sure you want to delete this user?')) return;
 
             try {
+                console.log(`Deleting ${uid} from ${listType}`);
+                
                 // Send delete command to ESP32
                 await database.ref(`${basePath}/commands/delete`).set({
                     list: listType,
-                    uid: uid,
+                    uid: uid.toUpperCase(),
                     timestamp: Date.now()
                 });
                 
                 showToast('Command sent: Delete user', 'success');
             } catch (error) {
-                showToast('Error sending delete command', 'error');
+                showToast('Error sending delete command: ' + error.message, 'error');
                 console.error(error);
             }
         }
@@ -1214,18 +1396,23 @@
             const name = sanitizeName(rawName);
 
             try {
+                console.log(`Renaming ${uid} to ${name} in ${listType}`);
+                
                 // Send rename command to ESP32
                 await database.ref(`${basePath}/commands/rename`).set({
                     list: listType,
-                    uid: uid,
+                    uid: uid.toUpperCase(),
                     name: name,
                     timestamp: Date.now()
                 });
                 
                 showToast('Command sent: Rename user', 'success');
                 closeModal();
+                
+                // Trigger a sync after a short delay to see the update
+                setTimeout(() => syncNow(), 2000);
             } catch (error) {
-                showToast('Error sending rename command', 'error');
+                showToast('Error sending rename command: ' + error.message, 'error');
                 console.error(error);
             }
         }
@@ -1265,6 +1452,8 @@
             }
 
             try {
+                console.log(`Adding ${uid} (${name}) to ${listType}`);
+                
                 // Send add command to ESP32
                 await database.ref(`${basePath}/commands/add`).set({
                     list: listType,
@@ -1275,8 +1464,11 @@
                 
                 showToast(`Command sent: Add to ${listType}`, 'success');
                 closeAddModal();
+                
+                // Trigger sync after delay to verify
+                setTimeout(() => syncNow(), 2000);
             } catch (error) {
-                showToast('Error sending add command', 'error');
+                showToast('Error sending add command: ' + error.message, 'error');
                 console.error(error);
             }
         }
@@ -1330,17 +1522,14 @@
             renderLogs();
         }
 
+        let currentDateFilter = null;
+        
         function filterLogsByDate(date) {
-            if (!date) {
-                currentLogFilter = 'all';
-                currentTypeFilter = 'all';
-            } else {
-                const selectedDate = new Date(date).toISOString().split('T')[0];
-                allLogs = allLogs.filter(log => {
-                    const logDate = new Date(log.time).toISOString().split('T')[0];
-                    return logDate === selectedDate;
-                });
-            }
+            currentDateFilter = date || null;
+            currentLogFilter = 'all';
+            currentTypeFilter = 'all';
+            document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+            document.querySelector('.filter-btn').classList.add('active');  // Select 'All' button
             renderLogs();
         }
 
